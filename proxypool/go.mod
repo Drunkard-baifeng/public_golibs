@@ -11,5 +11,3 @@ require (
 	go.uber.org/zap v1.27.1 // indirect
 	golang.org/x/sys v0.29.0 // indirect
 )
-
-replace github.com/Drunkard-baifeng/public_golibs/logger => ../logger
