@@ -1,4 +1,4 @@
-module github.com/Drunkard-baifeng/golibs/logger
+module github.com/Drunkard-baifeng/public_golibs/logger
 
 go 1.23.2
 

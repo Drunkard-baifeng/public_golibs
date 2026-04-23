@@ -1,4 +1,4 @@
-module github.com/Drunkard-baifeng/golibs/httpclient
+module github.com/Drunkard-baifeng/public_golibs/httpclient
 
 go 1.21
 
