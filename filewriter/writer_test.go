@@ -218,3 +218,45 @@ func TestSetDirSwitchInstance(t *testing.T) {
 		t.Fatalf("expected file not found in dir2: %v", err)
 	}
 }
+
+func TestPackageCloseAndReopen(t *testing.T) {
+	resetDefaultForTest(t)
+	defer resetDefaultForTest(t)
+
+	targetDir := filepath.Join(t.TempDir(), "pkg_close_reopen")
+	if err := SetDefaultDir(targetDir); err != nil {
+		t.Fatalf("SetDefaultDir failed: %v", err)
+	}
+
+	if err := SaveLine("first", "pkg_close_case"); err != nil {
+		t.Fatalf("SaveLine(first) failed: %v", err)
+	}
+
+	if err := Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	if err := SaveLine("second", "pkg_close_case"); err != nil {
+		t.Fatalf("SaveLine(second) failed: %v", err)
+	}
+
+	filePath := filepath.Join(targetDir, "pkg_close_case.txt")
+	f, err := os.Open(filePath)
+	if err != nil {
+		t.Fatalf("open file failed: %v", err)
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan file failed: %v", err)
+	}
+
+	if len(lines) != 2 || lines[0] != "first" || lines[1] != "second" {
+		t.Fatalf("unexpected lines: %+v", lines)
+	}
+}

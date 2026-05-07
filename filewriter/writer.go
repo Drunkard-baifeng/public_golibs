@@ -170,6 +170,20 @@ func SaveData(one, two, three, four string, filename ...string) error {
 	return w.SaveData(one, two, three, four, filename...)
 }
 
+// Close 关闭默认单例写入器并释放文件句柄。
+// 关闭后再次调用 SaveLine/SaveData 会按当前默认目录自动重建单例。
+func Close() error {
+	defaultMu.Lock()
+	w := defaultWriter
+	defaultWriter = nil
+	defaultMu.Unlock()
+
+	if w == nil {
+		return nil
+	}
+	return w.Close()
+}
+
 // Close 关闭全部已打开文件句柄。
 func (w *FileWriter) Close() error {
 	w.mu.Lock()

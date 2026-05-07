@@ -12,11 +12,7 @@ func main() {
 	if err := filewriter.SetDefaultDir("./data"); err != nil {
 		panic(err)
 	}
-	w, err := filewriter.Default()
-	if err != nil {
-		panic(err)
-	}
-	defer w.Close()
+	defer filewriter.Close()
 
 	// // 2) 正常写入（追加，不覆盖）
 	// if err := filewriter.SaveLine("hello world", "demo"); err != nil {
