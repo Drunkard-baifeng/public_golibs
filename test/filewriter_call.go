@@ -7,7 +7,7 @@ import (
 	"github.com/Drunkard-baifeng/public_golibs/filewriter"
 )
 
-func main() {
+func FileWriterCall() {
 	// 1) 全局单例只设置一次目录
 	if err := filewriter.SetDefaultDir("./data"); err != nil {
 		panic(err)

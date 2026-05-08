@@ -3,29 +3,39 @@ package proxypool
 import "sync"
 
 var (
+	defaultMu   sync.Mutex
 	defaultPool *ProxyPool
-	once        sync.Once
+	defaultCfg  Config
 )
 
 // Default 获取默认代理池（单例）
 func Default() *ProxyPool {
-	once.Do(func() {
-		defaultPool = New(Config{})
-	})
+	defaultMu.Lock()
+	defer defaultMu.Unlock()
+
+	if defaultPool == nil {
+		defaultPool = New(defaultCfg)
+	}
 	return defaultPool
 }
 
-// InitDefault 初始化默认代理池
+// InitDefault 初始化/重建默认代理池。
+// 后续 Default() 会返回这个新实例。
 func InitDefault(cfg Config) *ProxyPool {
-	once.Do(func() {
-		defaultPool = New(cfg)
-	})
+	defaultMu.Lock()
+	defer defaultMu.Unlock()
+
+	defaultCfg = cfg
+	defaultPool = New(cfg)
 	return defaultPool
 }
 
-// ResetDefault 重置默认代理池（用于测试）
-func ResetDefault() {
-	once = sync.Once{}
-	defaultPool = nil
+// Get 从默认代理池获取一个可用代理。
+func Get() (*ProxyItem, error) {
+	return Default().Get()
 }
 
+// GetStats 获取默认代理池统计信息。
+func GetStats() Stats {
+	return Default().GetStats()
+}
