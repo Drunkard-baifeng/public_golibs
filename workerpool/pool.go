@@ -56,14 +56,21 @@ func (p *Pool) dispatcher() {
 			if !ok {
 				return
 			}
+			if atomic.LoadInt32(&p.stopped) == 1 {
+				return
+			}
 			// 等待有空闲 worker
 			p.workerMu.Lock()
-			for p.activeCount >= p.maxWorkers {
+			for atomic.LoadInt32(&p.activeCount) >= atomic.LoadInt32(&p.maxWorkers) {
 				p.workerCond.Wait()
 				if atomic.LoadInt32(&p.stopped) == 1 {
 					p.workerMu.Unlock()
 					return
 				}
+			}
+			if atomic.LoadInt32(&p.stopped) == 1 {
+				p.workerMu.Unlock()
+				return
 			}
 			atomic.AddInt32(&p.activeCount, 1)
 			p.workerMu.Unlock()
