@@ -89,49 +89,69 @@ func defaultFetchFunc(apiURL string) ([]ProxyAddr, error) {
 
 // SetAPIURL 设置API地址
 func (p *ProxyPool) SetAPIURL(url string) *ProxyPool {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
 	p.apiURL = url
 	return p
 }
 
 // SetMaxUseCount 设置最大使用次数
 func (p *ProxyPool) SetMaxUseCount(count int) *ProxyPool {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
 	p.maxUseCount = count
 	return p
 }
 
 // SetExpireSeconds 设置过期时间
 func (p *ProxyPool) SetExpireSeconds(seconds int) *ProxyPool {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
 	p.expireSeconds = seconds
 	return p
 }
 
 // SetMinPoolSize 设置最小池大小
 func (p *ProxyPool) SetMinPoolSize(size int) *ProxyPool {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
 	p.minPoolSize = size
 	return p
 }
 
 // SetFetchFunc 设置自定义获取代理函数
 func (p *ProxyPool) SetFetchFunc(fn FetchFunc) *ProxyPool {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
 	p.fetchFunc = fn
 	return p
 }
 
 // SetOnProxyGet 设置获取代理回调
 func (p *ProxyPool) SetOnProxyGet(fn OnProxyGetFn) *ProxyPool {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
 	p.onProxyGet = fn
 	return p
 }
 
 // SetOnRefresh 设置刷新回调
 func (p *ProxyPool) SetOnRefresh(fn OnRefreshFn) *ProxyPool {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
 	p.onRefresh = fn
 	return p
 }
 
 // Refresh 刷新代理池
 func (p *ProxyPool) Refresh() error {
-	if p.apiURL == "" && p.fetchFunc == nil {
+	p.poolMu.RLock()
+	apiURL := p.apiURL
+	fetchFunc := p.fetchFunc
+	onRefresh := p.onRefresh
+	p.poolMu.RUnlock()
+
+	if apiURL == "" && fetchFunc == nil {
 		return ErrAPIURLEmpty
 	}
 
@@ -144,15 +164,15 @@ func (p *ProxyPool) Refresh() error {
 	var proxies []ProxyAddr
 	var err error
 
-	if p.fetchFunc != nil {
-		proxies, err = p.fetchFunc(p.apiURL)
+	if fetchFunc != nil {
+		proxies, err = fetchFunc(apiURL)
 	} else {
 		err = errors.New("请设置 FetchFunc")
 	}
 
 	if err != nil {
-		if p.onRefresh != nil {
-			p.onRefresh(0, err)
+		if onRefresh != nil {
+			onRefresh(0, err)
 		}
 		return err
 	}
@@ -165,8 +185,8 @@ func (p *ProxyPool) Refresh() error {
 		}
 	}
 
-	if p.onRefresh != nil {
-		p.onRefresh(count, nil)
+	if onRefresh != nil {
+		onRefresh(count, nil)
 	}
 
 	return nil

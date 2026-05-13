@@ -3,6 +3,7 @@ package proxypool
 import (
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 )
@@ -61,8 +62,8 @@ type Proxy struct {
 
 // 单例
 var (
-	defaultProxy     *Proxy
-	defaultProxyOnce sync.Once
+	defaultProxyMu sync.Mutex
+	defaultProxy   *Proxy
 )
 
 // NewProxy 创建代理管理器
@@ -78,9 +79,24 @@ func NewProxy() *Proxy {
 
 // DefaultProxy 获取默认代理管理器（单例）
 func DefaultProxy() *Proxy {
-	defaultProxyOnce.Do(func() {
+	defaultProxyMu.Lock()
+	defer defaultProxyMu.Unlock()
+
+	if defaultProxy == nil {
 		defaultProxy = NewProxy()
-	})
+	}
+	return defaultProxy
+}
+
+// InitDefaultProxy 初始化/重建默认代理管理器。
+func InitDefaultProxy(proxy *Proxy) *Proxy {
+	defaultProxyMu.Lock()
+	defer defaultProxyMu.Unlock()
+
+	if proxy == nil {
+		proxy = NewProxy()
+	}
+	defaultProxy = proxy
 	return defaultProxy
 }
 
@@ -176,42 +192,32 @@ func (p *Proxy) SetAuthProxy(authStr string) *Proxy {
 	defer p.mu.Unlock()
 
 	parts := splitAuthProxy(authStr)
+	p.authHost = ""
+	p.authPort = ""
+	p.authUsername = ""
+	p.authPassword = ""
+
 	if len(parts) >= 2 {
 		p.authHost = parts[0]
 		p.authPort = parts[1]
 	}
-	if len(parts) >= 4 {
+	if len(parts) >= 3 {
 		p.authUsername = parts[2]
+	}
+	if len(parts) >= 4 {
 		p.authPassword = parts[3]
-	} else {
-		p.authUsername = ""
-		p.authPassword = ""
 	}
 	return p
 }
 
 // splitAuthProxy 解析 ip:port:user:pass 格式
 func splitAuthProxy(s string) []string {
-	// 从后往前找，因为密码可能包含冒号
-	// 格式: ip:port:user:pass
-	result := make([]string, 0, 4)
-
-	// 简单按:分割，取前4个部分
-	start := 0
-	count := 0
-	for i := 0; i < len(s) && count < 4; i++ {
-		if s[i] == ':' {
-			result = append(result, s[start:i])
-			start = i + 1
-			count++
-		}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
 	}
-	// 最后一部分
-	if start < len(s) {
-		result = append(result, s[start:])
-	}
-
-	return result
+	// 限制最多分4段，最后一段保留剩余全部内容，支持密码内包含 ':'
+	return strings.SplitN(s, ":", 4)
 }
 
 // ==================== 获取代理 ====================
