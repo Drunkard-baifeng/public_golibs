@@ -1,6 +1,10 @@
 package proxypool
 
-import "testing"
+import (
+	"errors"
+	"testing"
+	"time"
+)
 
 func resetDefaultProxyForTest() {
 	defaultProxyMu.Lock()
@@ -59,5 +63,66 @@ func TestInitDefaultProxyRebuildsSingleton(t *testing.T) {
 	}
 	if p3.GetType() != TypeSocks5 {
 		t.Fatalf("type mismatch, got=%q want=%q", p3.GetType(), TypeSocks5)
+	}
+}
+
+func TestGetProxyOnceReturnsRefreshError(t *testing.T) {
+	fetchErr := errors.New("fetch failed")
+	p := NewProxy().SetMode(ModePool)
+	p.SetPoolAPI("http://example.com/get")
+
+	calls := 0
+	pool := p.GetPool().SetFetchFunc(func(apiURL string) ([]ProxyAddr, error) {
+		calls++
+		return nil, fetchErr
+	})
+
+	_, err := p.GetProxy()
+	if !errors.Is(err, fetchErr) {
+		t.Fatalf("expected fetch error, got=%v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("once mode should fetch once, got=%d", calls)
+	}
+	if !errors.Is(pool.LastRefreshError(), fetchErr) {
+		t.Fatalf("last refresh error mismatch, got=%v", pool.LastRefreshError())
+	}
+}
+
+func TestGetProxyMustSuccessCanBeStopped(t *testing.T) {
+	fetchErr := errors.New("fetch failed")
+	p := NewProxy().SetMode(ModePool)
+	p.SetPoolAPI("http://example.com/get")
+
+	calls := 0
+	p.GetPool().SetFetchFunc(func(apiURL string) ([]ProxyAddr, error) {
+		calls++
+		return nil, fetchErr
+	})
+	p.ResumeGetProxy()
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := p.GetProxy(GetProxyModeMustSuccess)
+		resultCh <- err
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	p.StopGetProxy()
+
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, ErrGetProxyStopped) {
+			t.Fatalf("expected stop error, got=%v", err)
+		}
+		if !errors.Is(err, fetchErr) {
+			t.Fatalf("expected joined fetch error, got=%v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("must-success mode was not stopped in time")
+	}
+
+	if calls == 0 {
+		t.Fatal("must-success mode should attempt to fetch before stop")
 	}
 }

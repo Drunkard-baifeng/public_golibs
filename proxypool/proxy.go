@@ -1,10 +1,12 @@
 package proxypool
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,6 +32,23 @@ const (
 	TypeSocks5 ProxyType = "socks5"
 )
 
+// GetProxyMode 获取代理策略
+type GetProxyMode int
+
+const (
+	// GetProxyModeOnce 只获取一次（成功或失败立即返回）
+	GetProxyModeOnce GetProxyMode = iota
+	// GetProxyModeMustSuccess 必须成功（循环获取，直到成功或被停止）
+	GetProxyModeMustSuccess
+)
+
+var (
+	// ErrGetProxyStopped 必成功模式下被停止标识中断
+	ErrGetProxyStopped = errors.New("获取代理已被停止标识中断")
+	// ErrInvalidGetProxyMode 非法获取策略
+	ErrInvalidGetProxyMode = errors.New("非法获取代理策略")
+)
+
 // ProxyResult 获取代理的结果
 type ProxyResult struct {
 	Type    ProxyType         // 代理协议类型 http/socks5
@@ -43,6 +62,7 @@ type Proxy struct {
 	mu        sync.RWMutex
 	mode      ProxyMode // 代理模式
 	proxyType ProxyType // 代理协议类型 http/socks5
+	getStop   atomic.Bool
 
 	// 代理池（内置）
 	pool *ProxyPool
@@ -222,14 +242,40 @@ func splitAuthProxy(s string) []string {
 
 // ==================== 获取代理 ====================
 
-// GetProxy 获取代理（统一入口，带重试）
-func (p *Proxy) GetProxy() (*ProxyResult, error) {
+// SetGetProxyStop 设置获取代理停止标识。
+// 当设置为 true 时，GetProxy( GetProxyModeMustSuccess ) 会中断并返回错误。
+func (p *Proxy) SetGetProxyStop(stop bool) *Proxy {
+	p.getStop.Store(stop)
+	return p
+}
+
+// StopGetProxy 停止必成功循环获取。
+func (p *Proxy) StopGetProxy() *Proxy {
+	return p.SetGetProxyStop(true)
+}
+
+// ResumeGetProxy 取消停止标识，恢复必成功循环获取能力。
+func (p *Proxy) ResumeGetProxy() *Proxy {
+	return p.SetGetProxyStop(false)
+}
+
+// GetProxy 获取代理（统一入口）。
+// 可选参数 mode：
+// - 不传：默认 GetProxyModeOnce
+// - GetProxyModeOnce：只尝试一次
+// - GetProxyModeMustSuccess：持续重试直到成功，或收到停止标识
+func (p *Proxy) GetProxy(modes ...GetProxyMode) (*ProxyResult, error) {
 	p.mu.RLock()
 	mode := p.mode
 	proxyType := p.proxyType
 	p.mu.RUnlock()
 
-	// 不换IP 和 虚拟IP 模式不需要重试
+	getMode := GetProxyModeOnce
+	if len(modes) > 0 {
+		getMode = modes[0]
+	}
+
+	// 不换IP/虚拟IP/账密IP：单次即返回
 	if mode == ModeNone {
 		return p.getNoProxy()
 	}
@@ -240,18 +286,54 @@ func (p *Proxy) GetProxy() (*ProxyResult, error) {
 		return p.getAuthProxy(proxyType)
 	}
 
-	// 代理池模式：循环重试直到获取成功
-	maxRetry := 10
-	for i := 0; i < maxRetry; i++ {
-		result, err := p.getPoolProxy(proxyType)
-		if err == nil {
-			return result, nil
+	// 代理池模式
+	switch getMode {
+	case GetProxyModeOnce:
+		return p.getPoolProxy(proxyType)
+	case GetProxyModeMustSuccess:
+		var lastErr error
+		for {
+			if p.getStop.Load() {
+				if lastErr != nil {
+					return nil, errors.Join(ErrGetProxyStopped, lastErr)
+				}
+				return nil, ErrGetProxyStopped
+			}
+
+			result, err := p.getPoolProxy(proxyType)
+			if err == nil {
+				return result, nil
+			}
+			lastErr = err
+			time.Sleep(time.Second)
 		}
-		// 获取失败，等待1秒后重试
-		time.Sleep(time.Second)
+	default:
+		return nil, ErrInvalidGetProxyMode
+	}
+}
+
+func (p *Proxy) getPoolProxy(proxyType ProxyType) (*ProxyResult, error) {
+	p.mu.Lock()
+	p.initPool()
+	pool := p.pool
+	p.mu.Unlock()
+
+	proxy, err := pool.Get()
+	if err != nil {
+		// 优先返回最近一次加载代理失败错误
+		if lastErr := pool.LastRefreshError(); lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, err
 	}
 
-	return nil, fmt.Errorf("获取代理失败，已重试 %d 次", maxRetry)
+	// 返回 ip:port 格式
+	return &ProxyResult{
+		Type:    proxyType,
+		Proxy:   proxy.String(), // ip:port
+		Headers: nil,
+		IP:      proxy.String(),
+	}, nil
 }
 
 // getNoProxy 不换IP模式
@@ -290,27 +372,6 @@ func (p *Proxy) getVirtualProxy() (*ProxyResult, error) {
 		Proxy:   "",
 		Headers: headers,
 		IP:      ip + " (虚拟)",
-	}, nil
-}
-
-// getPoolProxy 代理池模式
-func (p *Proxy) getPoolProxy(proxyType ProxyType) (*ProxyResult, error) {
-	p.mu.Lock()
-	p.initPool()
-	pool := p.pool
-	p.mu.Unlock()
-
-	proxy, err := pool.Get()
-	if err != nil {
-		return nil, err
-	}
-
-	// 返回 ip:port 格式
-	return &ProxyResult{
-		Type:    proxyType,
-		Proxy:   proxy.String(), // ip:port
-		Headers: nil,
-		IP:      proxy.String(),
 	}, nil
 }
 

@@ -17,6 +17,7 @@ type ProxyPool struct {
 	proxies       []*ProxyItem // 代理列表
 	poolMu        sync.RWMutex // 代理池读写锁
 	refreshMu     sync.Mutex   // 刷新锁（防止并发刷新）
+	lastErrMu     sync.RWMutex // 最近刷新错误读写锁
 	apiURL        string       // 代理API地址
 	maxUseCount   int          // 默认最大使用次数
 	expireSeconds int          // 默认过期时间（秒）
@@ -25,6 +26,7 @@ type ProxyPool struct {
 	onProxyGet    OnProxyGetFn // 获取代理回调
 	onRefresh     OnRefreshFn  // 刷新代理回调
 	roundRobinIdx int          // 轮询索引
+	lastErr       error        // 最近一次刷新错误
 }
 
 // FetchFunc 自定义获取代理函数类型
@@ -143,6 +145,19 @@ func (p *ProxyPool) SetOnRefresh(fn OnRefreshFn) *ProxyPool {
 	return p
 }
 
+// LastRefreshError 返回最近一次刷新错误（无错误时返回 nil）。
+func (p *ProxyPool) LastRefreshError() error {
+	p.lastErrMu.RLock()
+	defer p.lastErrMu.RUnlock()
+	return p.lastErr
+}
+
+func (p *ProxyPool) setLastRefreshError(err error) {
+	p.lastErrMu.Lock()
+	defer p.lastErrMu.Unlock()
+	p.lastErr = err
+}
+
 // Refresh 刷新代理池
 func (p *ProxyPool) Refresh() error {
 	p.poolMu.RLock()
@@ -152,6 +167,7 @@ func (p *ProxyPool) Refresh() error {
 	p.poolMu.RUnlock()
 
 	if apiURL == "" && fetchFunc == nil {
+		p.setLastRefreshError(ErrAPIURLEmpty)
 		return ErrAPIURLEmpty
 	}
 
@@ -171,11 +187,14 @@ func (p *ProxyPool) Refresh() error {
 	}
 
 	if err != nil {
+		p.setLastRefreshError(err)
 		if onRefresh != nil {
 			onRefresh(0, err)
 		}
 		return err
 	}
+
+	p.setLastRefreshError(nil)
 
 	// 添加新代理
 	count := 0
