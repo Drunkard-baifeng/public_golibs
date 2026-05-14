@@ -48,7 +48,7 @@ func InitProxyManager() *proxypool.Proxy {
 	proxymanager := proxypool.NewProxy()
 
 	// 设置代理模式
-	proxyMode := proxypool.ModeAuth
+	proxyMode := proxypool.ModePool
 	proxyType := proxypool.TypeSocks5
 
 	switch proxyMode {
@@ -94,7 +94,7 @@ func ProxypoolCall2() {
 	fmt.Println(proxy.IP)
 	fmt.Println(proxy.Headers)
 
-	proxy, err = proxypool.DefaultProxy().GetProxy()
+	proxy, err = proxypool.DefaultProxy().GetProxy(proxypool.GetProxyModeOnce)
 	if err != nil {
 		log.Fatal(err)
 	}

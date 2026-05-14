@@ -1,9 +1,11 @@
 package proxypool
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/Drunkard-baifeng/public_golibs/logger"
@@ -45,8 +47,25 @@ func SimpleFetchFunc(apiURL string) ([]ProxyAddr, error) {
 	if err != nil {
 		return nil, err
 	}
-	logger.Debugf("加载代理: %s", string(body))
-	result := ExtractIPPort(string(body))
+
+	bodyText := strings.TrimSpace(string(body))
+	logger.Debugf("加载代理: %s", bodyText)
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		if bodyText == "" {
+			bodyText = resp.Status
+		}
+		return nil, fmt.Errorf("加载代理失败: HTTP %d, %s", resp.StatusCode, bodyText)
+	}
+
+	result := ExtractIPPort(bodyText)
+	if len(result) == 0 {
+		if bodyText == "" {
+			return nil, fmt.Errorf("加载代理失败: 响应为空")
+		}
+		return nil, fmt.Errorf("加载代理失败: %s", bodyText)
+	}
+
 	logger.Successf("成功加载 %d 个代理", len(result))
 	return result, nil
 }
@@ -66,6 +85,22 @@ func CreateFetchFunc(httpClient *http.Client) FetchFunc {
 			return nil, err
 		}
 
-		return ExtractIPPort(string(body)), nil
+		bodyText := strings.TrimSpace(string(body))
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			if bodyText == "" {
+				bodyText = resp.Status
+			}
+			return nil, fmt.Errorf("加载代理失败: HTTP %d, %s", resp.StatusCode, bodyText)
+		}
+
+		result := ExtractIPPort(bodyText)
+		if len(result) == 0 {
+			if bodyText == "" {
+				return nil, fmt.Errorf("加载代理失败: 响应为空")
+			}
+			return nil, fmt.Errorf("加载代理失败: %s", bodyText)
+		}
+
+		return result, nil
 	}
 }
