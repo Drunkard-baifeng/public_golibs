@@ -320,9 +320,9 @@ func (p *Proxy) getPoolProxy(proxyType ProxyType) (*ProxyResult, error) {
 
 	proxy, err := pool.Get()
 	if err != nil {
-		// 优先返回最近一次加载代理失败错误
+		// 合并返回：当前获取错误 + 最近一次加载代理错误
 		if lastErr := pool.LastRefreshError(); lastErr != nil {
-			return nil, lastErr
+			return nil, errors.Join(err, lastErr)
 		}
 		return nil, err
 	}
