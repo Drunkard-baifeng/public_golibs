@@ -10,6 +10,8 @@ require github.com/Drunkard-baifeng/public_golibs/proxypool v0.0.0
 
 require github.com/Drunkard-baifeng/public_golibs/web3utils v0.0.0
 
+require github.com/Drunkard-baifeng/public_golibs/pop3client v0.0.0
+
 require (
 	github.com/Drunkard-baifeng/public_golibs/logger v1.0.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
@@ -44,8 +46,10 @@ require (
 	go.uber.org/zap v1.27.1 // indirect
 	golang.org/x/crypto v0.22.0 // indirect
 	golang.org/x/exp v0.0.0-20231110203233-9a3e6036ecaa // indirect
+	golang.org/x/net v0.24.0 // indirect
 	golang.org/x/sync v0.7.0 // indirect
 	golang.org/x/sys v0.29.0 // indirect
+	golang.org/x/text v0.14.0 // indirect
 	rsc.io/tmplfunc v0.0.3 // indirect
 )
 
@@ -56,3 +60,5 @@ replace github.com/Drunkard-baifeng/public_golibs/filewriter => ../filewriter
 replace github.com/Drunkard-baifeng/public_golibs/workerpool => ../workerpool
 
 replace github.com/Drunkard-baifeng/public_golibs/web3utils => ../web3utils
+
+replace github.com/Drunkard-baifeng/public_golibs/pop3client => ../pop3client

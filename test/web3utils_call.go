@@ -54,11 +54,11 @@ func Web3UtilsOnlineCall() {
 	rpcURL := "https://bsc-dataseed1.binance.org"
 	address := "0xc2b44a674bd4e7d9a50783a85f40744d37049eb4"
 
-	evm := web3utils.NewEVMWallet(rpcURL, 0)
-	defer evm.Close()
+	web3utils.InitDefaultEVM(rpcURL, 56)
+	defer func() { _ = web3utils.CloseDefaultEVM() }()
 
-	ok, balance, msg := evm.GetBalance(address)
-	fmt.Println("connected:", evm.Connected(), "chain:", evm.ChainName, evm.NativeToken)
+	ok, balance, msg := web3utils.GetBalanceDefault(address)
+	fmt.Println("connected:", web3utils.DefaultEVM().Connected(), "chain:", web3utils.DefaultEVM().ChainName, web3utils.DefaultEVM().NativeToken)
 	fmt.Println("balance:", ok, balance, msg)
 }
 
@@ -67,11 +67,11 @@ func Web3UtilsGetTokenBalanceCall() {
 	userAddress := "0xc2b44a674bd4e7d9a50783a85f40744d37049eb4"
 	tokenContract := "0x55d398326f99059fF775485246999027B3197955" // BSC-USDT
 
-	evm := web3utils.NewEVMWallet(rpcURL, 56)
-	defer evm.Close()
+	web3utils.InitDefaultEVM(rpcURL, 56)
+	defer func() { _ = web3utils.CloseDefaultEVM() }()
 
-	ok, balance, msg := evm.GetTokenBalance(userAddress, tokenContract, "")
-	fmt.Println("connected:", evm.Connected(), "chain:", evm.ChainName, evm.NativeToken)
+	ok, balance, msg := web3utils.GetTokenBalanceDefault(userAddress, tokenContract, "")
+	fmt.Println("connected:", web3utils.DefaultEVM().Connected(), "chain:", web3utils.DefaultEVM().ChainName, web3utils.DefaultEVM().NativeToken)
 	fmt.Println("token balance:", ok, balance, msg)
 }
 
@@ -86,15 +86,15 @@ func Web3UtilsTransferCoinCall() {
 		return
 	}
 
-	evm := web3utils.NewEVMWallet(rpcURL, 56)
-	defer evm.Close()
+	web3utils.InitDefaultEVM(rpcURL, 56)
+	defer func() { _ = web3utils.CloseDefaultEVM() }()
 
 	opts := web3utils.DefaultTransferCoinOptions()
 	opts.WaitForConfirmation = true
 	opts.GasPriceBuffer = 1.2
 	opts.GasLimitBuffer = 1.2
 
-	ok, txHash, msg := evm.TransferCoin(privateKey, toAddress, amount, opts)
+	ok, txHash, msg := web3utils.TransferCoinDefault(privateKey, toAddress, amount, opts)
 	fmt.Println("transfer coin:", ok, txHash, msg)
 }
 
@@ -110,14 +110,14 @@ func Web3UtilsTransferTokenCall() {
 		return
 	}
 
-	evm := web3utils.NewEVMWallet(rpcURL, 56)
-	defer evm.Close()
+	web3utils.InitDefaultEVM(rpcURL, 56)
+	defer func() { _ = web3utils.CloseDefaultEVM() }()
 
 	opts := web3utils.DefaultTransferTokenOptions()
 	opts.WaitForConfirmation = true
 	opts.GasPriceBuffer = 1.2
 	opts.GasLimitBuffer = 1.2
 
-	ok, txHash, msg := evm.TransferToken(privateKey, toAddress, amount, tokenContract, opts)
+	ok, txHash, msg := web3utils.TransferTokenDefault(privateKey, toAddress, amount, tokenContract, opts)
 	fmt.Println("transfer token:", ok, txHash, msg)
 }
