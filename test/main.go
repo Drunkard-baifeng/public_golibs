@@ -10,5 +10,7 @@ func main() {
 	// Web3UtilsGetTokenBalanceCall()
 	// Web3UtilsTransferCoinCall()
 	// Web3UtilsTransferTokenCall()
-	Pop3ClientCall()
+	// Pop3ClientCall()
+	// WebSocketCall()
+	WSTest()
 }

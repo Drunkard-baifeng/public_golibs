@@ -13,6 +13,11 @@ require github.com/Drunkard-baifeng/public_golibs/web3utils v0.0.0
 require github.com/Drunkard-baifeng/public_golibs/pop3client v0.0.0
 
 require (
+	github.com/Drunkard-baifeng/public_golibs/websocket v0.0.0
+	github.com/gorilla/websocket v1.5.0
+)
+
+require (
 	github.com/Drunkard-baifeng/public_golibs/logger v1.0.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/StackExchange/wmi v1.2.1 // indirect
@@ -31,7 +36,6 @@ require (
 	github.com/ethereum/go-ethereum v1.14.12 // indirect
 	github.com/ethereum/go-verkle v0.1.1-0.20240829091221-dffa7562dbe9 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
-	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/holiman/uint256 v1.3.1 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -62,3 +66,5 @@ replace github.com/Drunkard-baifeng/public_golibs/workerpool => ../workerpool
 replace github.com/Drunkard-baifeng/public_golibs/web3utils => ../web3utils
 
 replace github.com/Drunkard-baifeng/public_golibs/pop3client => ../pop3client
+
+replace github.com/Drunkard-baifeng/public_golibs/websocket => ../websocket
