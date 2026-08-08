@@ -3,6 +3,7 @@ package proxypool
 import (
 	"errors"
 	"regexp"
+	"strings"
 	"sync"
 )
 
@@ -166,7 +167,7 @@ func (p *ProxyPool) Refresh() error {
 	onRefresh := p.onRefresh
 	p.poolMu.RUnlock()
 
-	if apiURL == "" && fetchFunc == nil {
+	if strings.TrimSpace(apiURL) == "" {
 		p.setLastRefreshError(ErrAPIURLEmpty)
 		return ErrAPIURLEmpty
 	}
@@ -251,8 +252,6 @@ func (p *ProxyPool) Get() (*ProxyItem, error) {
 		go p.Refresh()
 	}
 
-	defer p.poolMu.Unlock()
-
 	// 获取可用代理
 	available := make([]*ProxyItem, 0)
 	for _, proxy := range p.proxies {
@@ -262,6 +261,7 @@ func (p *ProxyPool) Get() (*ProxyItem, error) {
 	}
 
 	if len(available) == 0 {
+		p.poolMu.Unlock()
 		return nil, ErrNoAvailableProxy
 	}
 
@@ -271,12 +271,15 @@ func (p *ProxyPool) Get() (*ProxyItem, error) {
 	proxy := available[idx]
 
 	if proxy.IncrementUseCount() {
-		if p.onProxyGet != nil {
-			p.onProxyGet(proxy)
+		onProxyGet := p.onProxyGet
+		p.poolMu.Unlock()
+		if onProxyGet != nil {
+			onProxyGet(proxy)
 		}
 		return proxy, nil
 	}
 
+	p.poolMu.Unlock()
 	return nil, ErrNoAvailableProxy
 }
 

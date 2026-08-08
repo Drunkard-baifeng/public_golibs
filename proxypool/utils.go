@@ -3,8 +3,10 @@ package proxypool
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,7 +21,7 @@ func ExtractIPPort(text string) []ProxyAddr {
 	matches := defaultIPPortRegex.FindAllStringSubmatch(text, -1)
 	result := make([]ProxyAddr, 0, len(matches))
 	for _, match := range matches {
-		if len(match) >= 3 {
+		if len(match) >= 3 && isValidProxyAddr(match[1], match[2]) {
 			result = append(result, ProxyAddr{
 				IP:   match[1],
 				Port: match[2],
@@ -27,6 +29,20 @@ func ExtractIPPort(text string) []ProxyAddr {
 		}
 	}
 	return result
+}
+
+func isValidProxyAddr(ipStr, portStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil || ip.To4() == nil {
+		return false
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return false
+	}
+
+	return true
 }
 
 // SimpleFetchFunc 简单的HTTP获取函数（使用标准库）
