@@ -15,38 +15,49 @@ import (
 
 // Client HTTP客户端
 type Client struct {
-	httpClient   *http.Client
-	transport    *http.Transport
-	headers      map[string]string
-	cookies      map[string]string
-	timeout      time.Duration
-	maxRedirects int
-	verify       bool
-	proxyURL     string
-	proxyType    string // "http" 或 "socks5"
-	jar          *cookiejar.Jar
+	httpClient        *http.Client
+	transport         *http.Transport
+	headers           map[string]string
+	cookies           map[string]string
+	timeout           time.Duration
+	maxRedirects      int
+	verify            bool
+	maxIdleConns      int
+	idleConnTimeout   time.Duration
+	disableKeepAlives bool
+	proxyURL          string
+	proxyType         string // "http" 或 "socks5"
+	jar               *cookiejar.Jar
 }
+
+const (
+	defaultMaxIdleConns    = 100
+	defaultIdleConnTimeout = 5 * time.Minute
+)
 
 // New 创建新的HTTP客户端
 func New() *Client {
 	jar, _ := cookiejar.New(nil)
 
 	c := &Client{
-		headers:      make(map[string]string),
-		cookies:      make(map[string]string),
-		timeout:      30 * time.Second,
-		maxRedirects: 5,
-		verify:       true,
-		jar:          jar,
-		proxyType:    "",
+		headers:           make(map[string]string),
+		cookies:           make(map[string]string),
+		timeout:           30 * time.Second,
+		maxRedirects:      5,
+		verify:            true,
+		jar:               jar,
+		proxyType:         "",
+		maxIdleConns:      defaultMaxIdleConns,
+		idleConnTimeout:   defaultIdleConnTimeout,
+		disableKeepAlives: false,
 	}
 
 	// 创建 Transport，使用动态代理函数
 	c.transport = &http.Transport{
-		MaxIdleConns:          100,
+		MaxIdleConns:          c.maxIdleConns,
 		MaxIdleConnsPerHost:   100,
 		MaxConnsPerHost:       100,
-		IdleConnTimeout:       90 * time.Second,
+		IdleConnTimeout:       c.idleConnTimeout,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DisableKeepAlives:     false,
@@ -88,13 +99,21 @@ type Config struct {
 func NewWithConfig(cfg Config) *Client {
 	c := New()
 
-	// 禁用 Keep-Alive（必须在设置代理之前，因为会影响 Transport）
-	if cfg.DisableKeepAlives {
-		c.transport.DisableKeepAlives = true
-	}
-
 	if cfg.Timeout > 0 {
 		c.SetTimeout(cfg.Timeout)
+	}
+	if cfg.MaxIdleConns > 0 {
+		c.maxIdleConns = cfg.MaxIdleConns
+		c.transport.MaxIdleConns = cfg.MaxIdleConns
+	}
+	if cfg.IdleConnTimeout > 0 {
+		c.idleConnTimeout = cfg.IdleConnTimeout
+		c.transport.IdleConnTimeout = cfg.IdleConnTimeout
+	}
+	// 禁用 Keep-Alive（必须在设置代理之前，因为会影响 Transport）
+	if cfg.DisableKeepAlives {
+		c.disableKeepAlives = true
+		c.transport.DisableKeepAlives = true
 	}
 	if cfg.MaxRedirects > 0 {
 		c.SetMaxRedirects(cfg.MaxRedirects)
@@ -202,13 +221,13 @@ func (c *Client) rebuildTransport() {
 	}
 
 	transport := &http.Transport{
-		MaxIdleConns:          100,
+		MaxIdleConns:          c.maxIdleConns,
 		MaxIdleConnsPerHost:   100,
 		MaxConnsPerHost:       100,
-		IdleConnTimeout:       90 * time.Second,
+		IdleConnTimeout:       c.idleConnTimeout,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		DisableKeepAlives:     false,
+		DisableKeepAlives:     c.disableKeepAlives,
 	}
 
 	// SSL验证配置
