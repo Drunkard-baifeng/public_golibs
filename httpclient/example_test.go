@@ -111,7 +111,7 @@ func Example_withConfig() {
 	client := httpclient.NewWithConfig(httpclient.Config{
 		Timeout:      60 * time.Second,
 		MaxRedirects: 10,
-		Verify:       false,
+		Verify:       httpclient.BoolPtr(false),
 		Proxy:        "127.0.0.1:7890",
 		ProxyType:    "http",
 	})

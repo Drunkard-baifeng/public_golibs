@@ -3,124 +3,108 @@ package httpclient
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
 )
 
-// Client HTTP客户端
+// Client HTTP客户端。
 type Client struct {
-	httpClient        *http.Client
-	transport         *http.Transport
-	headers           map[string]string
-	cookies           map[string]string
+	mu sync.RWMutex
+
+	transport       *http.Transport
+	headers         map[string]string
+	cookies         map[string]string
+	observedCookies map[string]string
+	jar             http.CookieJar
+
 	timeout           time.Duration
 	maxRedirects      int
 	verify            bool
 	maxIdleConns      int
 	idleConnTimeout   time.Duration
 	disableKeepAlives bool
-	proxyURL          string
-	proxyType         string // "http" 或 "socks5"
-	jar               *cookiejar.Jar
+	proxyURL          *url.URL
+	proxyType         string
+	configErr         error
 }
 
 const (
 	defaultMaxIdleConns    = 100
 	defaultIdleConnTimeout = 5 * time.Minute
+	defaultMaxRedirects    = 5
 )
 
-// New 创建新的HTTP客户端
+// Config 客户端配置选项。
+type Config struct {
+	Timeout           time.Duration
+	MaxRedirects      int
+	Verify            *bool // nil 表示使用安全默认值 true
+	Proxy             string
+	ProxyType         string // "http" 或 "socks5"
+	MaxIdleConns      int
+	IdleConnTimeout   time.Duration
+	DisableKeepAlives bool
+}
+
+// BoolPtr 返回布尔值指针，便于设置 Config.Verify。
+func BoolPtr(value bool) *bool {
+	return &value
+}
+
+// New 创建新的HTTP客户端。
 func New() *Client {
 	jar, _ := cookiejar.New(nil)
-
 	c := &Client{
 		headers:           make(map[string]string),
 		cookies:           make(map[string]string),
-		timeout:           30 * time.Second,
-		maxRedirects:      5,
-		verify:            true,
+		observedCookies:   make(map[string]string),
 		jar:               jar,
-		proxyType:         "",
+		timeout:           30 * time.Second,
+		maxRedirects:      defaultMaxRedirects,
+		verify:            true,
 		maxIdleConns:      defaultMaxIdleConns,
 		idleConnTimeout:   defaultIdleConnTimeout,
 		disableKeepAlives: false,
 	}
 
-	// 创建 Transport，使用动态代理函数
-	c.transport = &http.Transport{
-		MaxIdleConns:          c.maxIdleConns,
-		MaxIdleConnsPerHost:   100,
-		MaxConnsPerHost:       100,
-		IdleConnTimeout:       c.idleConnTimeout,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		DisableKeepAlives:     false,
-		Proxy:                 c.getProxyFunc(), // 动态代理函数
-	}
-
-	c.httpClient = &http.Client{
-		Transport: c.transport,
-		Jar:       jar,
-		Timeout:   30 * time.Second,
-	}
-
+	c.transport, _ = c.buildTransportLocked()
 	return c
 }
 
-// getProxyFunc 返回动态代理函数（用于 HTTP 代理）
-func (c *Client) getProxyFunc() func(*http.Request) (*url.URL, error) {
-	return func(req *http.Request) (*url.URL, error) {
-		if c.proxyURL == "" || c.proxyType == "socks5" {
-			return nil, nil
-		}
-		return url.Parse(c.proxyURL)
-	}
-}
-
-// Config 客户端配置选项
-type Config struct {
-	Timeout           time.Duration
-	MaxRedirects      int
-	Verify            bool
-	Proxy             string
-	ProxyType         string // "http" 或 "socks5"
-	MaxIdleConns      int
-	IdleConnTimeout   time.Duration
-	DisableKeepAlives bool // 禁用连接复用（每次请求后立即关闭连接）
-}
-
-// NewWithConfig 使用配置创建HTTP客户端
+// NewWithConfig 使用配置创建HTTP客户端。
 func NewWithConfig(cfg Config) *Client {
 	c := New()
 
 	if cfg.Timeout > 0 {
-		c.SetTimeout(cfg.Timeout)
+		c.timeout = cfg.Timeout
+	}
+	if cfg.MaxRedirects > 0 {
+		c.maxRedirects = cfg.MaxRedirects
+	}
+	if cfg.Verify != nil {
+		c.verify = *cfg.Verify
 	}
 	if cfg.MaxIdleConns > 0 {
 		c.maxIdleConns = cfg.MaxIdleConns
-		c.transport.MaxIdleConns = cfg.MaxIdleConns
 	}
 	if cfg.IdleConnTimeout > 0 {
 		c.idleConnTimeout = cfg.IdleConnTimeout
-		c.transport.IdleConnTimeout = cfg.IdleConnTimeout
 	}
-	// 禁用 Keep-Alive（必须在设置代理之前，因为会影响 Transport）
-	if cfg.DisableKeepAlives {
-		c.disableKeepAlives = true
-		c.transport.DisableKeepAlives = true
-	}
-	if cfg.MaxRedirects > 0 {
-		c.SetMaxRedirects(cfg.MaxRedirects)
-	}
-	if !cfg.Verify {
-		c.SetVerify(false)
-	}
+	c.disableKeepAlives = cfg.DisableKeepAlives
+
+	// Rebuild once after applying all non-proxy transport settings.
+	c.transport.CloseIdleConnections()
+	c.transport, _ = c.buildTransportLocked()
+
 	if cfg.Proxy != "" {
 		proxyType := cfg.ProxyType
 		if proxyType == "" {
@@ -132,95 +116,134 @@ func NewWithConfig(cfg Config) *Client {
 	return c
 }
 
-// SetProxy 设置代理
-// proxyStr: 代理地址，格式: "ip:port" 或 "ip:port:user:pass" 或完整URL
-// proxyType: 代理类型 "http" 或 "socks5"
+// SetProxy 设置代理。配置错误会由 ProxyError 和下一次请求返回。
 func (c *Client) SetProxy(proxyStr string, proxyType string) *Client {
-	oldProxyType := c.proxyType
-
-	if proxyStr == "" {
-		c.proxyURL = ""
-		c.proxyType = ""
-		// 如果之前是 SOCKS5，需要重建 Transport
-		if oldProxyType == "socks5" {
-			c.rebuildTransport()
-		}
-		// 关闭旧的空闲连接
-		c.transport.CloseIdleConnections()
-		return c
-	}
-
-	// 解析代理类型和地址
-	newProxyType := strings.ToLower(proxyType)
-
-	// 如果已经包含协议头，从中提取类型
-	if strings.HasPrefix(proxyStr, "socks5://") {
-		newProxyType = "socks5"
-		c.proxyURL = proxyStr
-	} else if strings.HasPrefix(proxyStr, "http://") || strings.HasPrefix(proxyStr, "https://") {
-		newProxyType = "http"
-		c.proxyURL = proxyStr
-	} else {
-		// 解析代理字符串
-		parts := strings.Split(proxyStr, ":")
-
-		if newProxyType == "socks5" {
-			if len(parts) == 2 {
-				c.proxyURL = "socks5://" + parts[0] + ":" + parts[1]
-			} else if len(parts) == 4 {
-				// ip:port:user:pass 格式
-				c.proxyURL = "socks5://" + parts[2] + ":" + parts[3] + "@" + parts[0] + ":" + parts[1]
-			}
-		} else {
-			newProxyType = "http"
-			if len(parts) == 2 {
-				c.proxyURL = "http://" + parts[0] + ":" + parts[1]
-			} else if len(parts) == 4 {
-				c.proxyURL = "http://" + parts[2] + ":" + parts[3] + "@" + parts[0] + ":" + parts[1]
-			}
-		}
-	}
-
-	c.proxyType = newProxyType
-
-	// 判断是否需要重建 Transport
-	// 只有在 HTTP <-> SOCKS5 切换时才需要重建
-	needRebuild := (oldProxyType == "socks5" && newProxyType != "socks5") ||
-		(oldProxyType != "socks5" && newProxyType == "socks5")
-
-	if needRebuild {
-		c.rebuildTransport()
-	} else {
-		// HTTP 代理切换：只需关闭旧连接，Proxy 函数会自动使用新地址
-		c.transport.CloseIdleConnections()
-	}
-
+	_ = c.ConfigureProxy(proxyStr, proxyType)
 	return c
 }
 
-// SetHTTPProxy 快捷方法：设置 HTTP 代理
+// ConfigureProxy 设置代理并直接返回配置错误。
+func (c *Client) ConfigureProxy(proxyStr string, proxyType string) error {
+	proxyURL, normalizedType, err := parseProxy(proxyStr, proxyType)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err != nil {
+		c.proxyURL = nil
+		c.proxyType = ""
+		c.configErr = err
+		_ = c.rebuildTransportLocked()
+		return err
+	}
+
+	c.proxyURL = proxyURL
+	c.proxyType = normalizedType
+	c.configErr = c.rebuildTransportLocked()
+	return c.configErr
+}
+
+// ProxyError 返回最近一次代理配置错误。
+func (c *Client) ProxyError() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.configErr
+}
+
+// SetHTTPProxy 快捷方法：设置 HTTP 代理。
 func (c *Client) SetHTTPProxy(proxyStr string) *Client {
 	return c.SetProxy(proxyStr, "http")
 }
 
-// SetSocks5Proxy 快捷方法：设置 SOCKS5 代理
+// SetSocks5Proxy 快捷方法：设置 SOCKS5 代理。
 func (c *Client) SetSocks5Proxy(proxyStr string) *Client {
 	return c.SetProxy(proxyStr, "socks5")
 }
 
-// ClearProxy 清除代理
+// ClearProxy 清除代理。
 func (c *Client) ClearProxy() *Client {
 	return c.SetProxy("", "")
 }
 
-// rebuildTransport 重建Transport（仅在必要时调用）
-func (c *Client) rebuildTransport() {
-	// 关闭旧的连接
-	if c.transport != nil {
-		c.transport.CloseIdleConnections()
+func parseProxy(proxyStr string, proxyType string) (*url.URL, string, error) {
+	proxyStr = strings.TrimSpace(proxyStr)
+	if proxyStr == "" {
+		return nil, "", nil
 	}
 
+	normalizedType := strings.ToLower(strings.TrimSpace(proxyType))
+	if normalizedType == "" {
+		normalizedType = "http"
+	}
+	if normalizedType != "http" && normalizedType != "socks5" {
+		return nil, "", fmt.Errorf("不支持的代理类型 %q", proxyType)
+	}
+
+	if strings.Contains(proxyStr, "://") {
+		proxyURL, err := url.Parse(proxyStr)
+		if err != nil {
+			return nil, "", fmt.Errorf("解析代理地址失败: %w", err)
+		}
+		switch strings.ToLower(proxyURL.Scheme) {
+		case "http", "https":
+			normalizedType = "http"
+		case "socks5":
+			normalizedType = "socks5"
+		default:
+			return nil, "", fmt.Errorf("不支持的代理协议 %q", proxyURL.Scheme)
+		}
+		if err := validateProxyURL(proxyURL); err != nil {
+			return nil, "", err
+		}
+		proxyURL.Scheme = strings.ToLower(proxyURL.Scheme)
+		return proxyURL, normalizedType, nil
+	}
+
+	hostPort := proxyStr
+	var user *url.Userinfo
+	if _, _, err := net.SplitHostPort(proxyStr); err != nil {
+		if parts := strings.Split(proxyStr, ":"); len(parts) == 4 {
+			hostPort = net.JoinHostPort(parts[0], parts[1])
+			user = url.UserPassword(parts[2], parts[3])
+		}
+	}
+
+	proxyURL := &url.URL{Scheme: normalizedType, Host: hostPort, User: user}
+	if err := validateProxyURL(proxyURL); err != nil {
+		return nil, "", err
+	}
+	return proxyURL, normalizedType, nil
+}
+
+func validateProxyURL(proxyURL *url.URL) error {
+	if proxyURL.Hostname() == "" {
+		return fmt.Errorf("代理地址缺少主机名")
+	}
+	port := proxyURL.Port()
+	if port == "" {
+		return fmt.Errorf("代理地址缺少端口")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return fmt.Errorf("代理端口无效: %q", port)
+	}
+	if proxyURL.Path != "" && proxyURL.Path != "/" {
+		return fmt.Errorf("代理地址不能包含路径")
+	}
+	if proxyURL.RawQuery != "" || proxyURL.Fragment != "" {
+		return fmt.Errorf("代理地址不能包含查询参数或片段")
+	}
+	return nil
+}
+
+func (c *Client) buildTransportLocked() (*http.Transport, error) {
+	directDialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
 	transport := &http.Transport{
+		DialContext:           directDialer.DialContext,
+		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          c.maxIdleConns,
 		MaxIdleConnsPerHost:   100,
 		MaxConnsPerHost:       100,
@@ -230,181 +253,208 @@ func (c *Client) rebuildTransport() {
 		DisableKeepAlives:     c.disableKeepAlives,
 	}
 
-	// SSL验证配置
 	if !c.verify {
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
 
-	// 代理配置
-	if c.proxyType == "socks5" && c.proxyURL != "" {
-		// SOCKS5 代理需要自定义 DialContext
-		proxyURL, err := url.Parse(c.proxyURL)
-		if err == nil {
-			var auth *proxy.Auth
-			if proxyURL.User != nil {
-				auth = &proxy.Auth{
-					User: proxyURL.User.Username(),
-				}
-				auth.Password, _ = proxyURL.User.Password()
-			}
+	if c.proxyURL == nil {
+		return transport, nil
+	}
 
-			dialer, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
-			if err == nil {
-				transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-					return dialer.Dial(network, addr)
-				}
-			}
+	switch c.proxyType {
+	case "http":
+		transport.Proxy = http.ProxyURL(c.proxyURL)
+	case "socks5":
+		var auth *proxy.Auth
+		if c.proxyURL.User != nil {
+			auth = &proxy.Auth{User: c.proxyURL.User.Username()}
+			auth.Password, _ = c.proxyURL.User.Password()
 		}
-	} else {
-		// HTTP 代理使用动态 Proxy 函数
-		transport.Proxy = c.getProxyFunc()
+
+		dialer, err := proxy.SOCKS5("tcp", c.proxyURL.Host, auth, directDialer)
+		if err != nil {
+			return nil, fmt.Errorf("创建 SOCKS5 代理失败: %w", err)
+		}
+		contextDialer, ok := dialer.(proxy.ContextDialer)
+		if !ok {
+			return nil, fmt.Errorf("SOCKS5 代理不支持上下文取消")
+		}
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return contextDialer.DialContext(ctx, network, addr)
+		}
+	default:
+		return nil, fmt.Errorf("不支持的代理类型 %q", c.proxyType)
 	}
 
-	c.transport = transport
-	c.httpClient.Transport = transport
+	return transport, nil
 }
 
-// SetVerify 设置是否验证SSL证书
+func (c *Client) rebuildTransportLocked() error {
+	transport, err := c.buildTransportLocked()
+	if err != nil {
+		return err
+	}
+	oldTransport := c.transport
+	c.transport = transport
+	if oldTransport != nil {
+		oldTransport.CloseIdleConnections()
+	}
+	return nil
+}
+
+// SetVerify 设置是否验证SSL证书。
 func (c *Client) SetVerify(verify bool) *Client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.verify == verify {
-		return c // 没有变化，不需要更新
+		return c
 	}
 	c.verify = verify
-
-	// 更新 TLS 配置
-	if c.transport.TLSClientConfig == nil {
-		c.transport.TLSClientConfig = &tls.Config{}
+	if err := c.rebuildTransportLocked(); err != nil {
+		c.configErr = err
 	}
-	c.transport.TLSClientConfig.InsecureSkipVerify = !verify
-
 	return c
 }
 
-// SetTimeout 设置超时时间
+// SetTimeout 设置超时时间。
 func (c *Client) SetTimeout(timeout time.Duration) *Client {
+	c.mu.Lock()
 	c.timeout = timeout
-	c.httpClient.Timeout = timeout
+	c.mu.Unlock()
 	return c
 }
 
-// SetMaxRedirects 设置最大重定向次数
+// SetMaxRedirects 设置最大重定向次数。
 func (c *Client) SetMaxRedirects(maxRedirects int) *Client {
+	c.mu.Lock()
 	c.maxRedirects = maxRedirects
-	c.httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) >= maxRedirects {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	}
+	c.mu.Unlock()
 	return c
 }
 
-// Close 关闭客户端，释放所有连接资源
+// Close 关闭客户端，释放所有空闲连接资源。
 func (c *Client) Close() {
-	if c.transport != nil {
-		c.transport.CloseIdleConnections()
+	c.mu.RLock()
+	transport := c.transport
+	c.mu.RUnlock()
+	if transport != nil {
+		transport.CloseIdleConnections()
 	}
 }
 
-// SetHeaders 设置默认请求头（覆盖）
+// SetHeaders 设置默认请求头（覆盖）。
 func (c *Client) SetHeaders(headers map[string]string) *Client {
-	c.headers = make(map[string]string)
-	for k, v := range headers {
-		c.headers[normalizeHeaderKey(k)] = v
-	}
+	c.mu.Lock()
+	c.headers = cloneHeaders(headers)
+	c.mu.Unlock()
 	return c
 }
 
-// AddHeader 添加单个请求头
+// AddHeader 添加单个请求头。
 func (c *Client) AddHeader(key, value string) *Client {
-	c.headers[normalizeHeaderKey(key)] = value
+	c.mu.Lock()
+	c.headers[http.CanonicalHeaderKey(key)] = value
+	c.mu.Unlock()
 	return c
 }
 
-// UpdateHeaders 更新请求头（合并）
+// UpdateHeaders 更新请求头（合并）。
 func (c *Client) UpdateHeaders(headers map[string]string) *Client {
-	for k, v := range headers {
-		c.headers[normalizeHeaderKey(k)] = v
+	c.mu.Lock()
+	for key, value := range headers {
+		c.headers[http.CanonicalHeaderKey(key)] = value
 	}
+	c.mu.Unlock()
 	return c
 }
 
-// normalizeHeaderKey 标准化header key
-func normalizeHeaderKey(key string) string {
-	parts := strings.Split(key, "-")
-	for i, p := range parts {
-		if len(p) > 0 {
-			parts[i] = strings.ToUpper(p[:1]) + strings.ToLower(p[1:])
-		}
+func cloneHeaders(headers map[string]string) map[string]string {
+	result := make(map[string]string, len(headers))
+	for key, value := range headers {
+		result[http.CanonicalHeaderKey(key)] = value
 	}
-	return strings.Join(parts, "-")
+	return result
 }
 
-// SetCookies 设置Cookie（覆盖）
+// SetCookies 设置每次请求携带的默认 Cookie（覆盖）。
 func (c *Client) SetCookies(cookies map[string]string) *Client {
-	c.cookies = make(map[string]string)
-	for k, v := range cookies {
-		c.cookies[k] = v
-	}
+	c.mu.Lock()
+	c.cookies = cloneStringMap(cookies)
+	c.mu.Unlock()
 	return c
 }
 
-// AddCookie 添加单个Cookie
+// AddCookie 添加单个默认 Cookie。
 func (c *Client) AddCookie(name, value string) *Client {
+	c.mu.Lock()
 	c.cookies[name] = value
+	c.mu.Unlock()
 	return c
 }
 
-// UpdateCookies 更新Cookie
+// UpdateCookies 更新默认 Cookie。
 func (c *Client) UpdateCookies(cookies interface{}) *Client {
-	switch v := cookies.(type) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	switch value := cookies.(type) {
 	case string:
-		// 解析Cookie字符串
-		for _, item := range strings.Split(v, ";") {
+		for _, item := range strings.Split(value, ";") {
 			item = strings.TrimSpace(item)
 			if idx := strings.Index(item, "="); idx > 0 {
 				key := strings.TrimSpace(item[:idx])
-				value := strings.TrimSpace(item[idx+1:])
-				c.cookies[key] = value
+				c.cookies[key] = strings.TrimSpace(item[idx+1:])
 			}
 		}
 	case map[string]string:
-		for k, v := range v {
-			c.cookies[k] = v
+		for key, item := range value {
+			c.cookies[key] = item
 		}
 	}
 	return c
 }
 
-// GetCookies 获取当前所有Cookie
+// GetCookies 获取默认 Cookie 和已观察到的响应 Cookie。
 func (c *Client) GetCookies() map[string]string {
-	result := make(map[string]string)
-	for k, v := range c.cookies {
-		result[k] = v
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := cloneStringMap(c.observedCookies)
+	for key, value := range c.cookies {
+		result[key] = value
 	}
 	return result
 }
 
-// GetHeaders 获取当前所有默认请求头
+// GetHeaders 获取当前所有默认请求头。
 func (c *Client) GetHeaders() map[string]string {
-	result := make(map[string]string)
-	for k, v := range c.headers {
-		result[k] = v
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return cloneStringMap(c.headers)
+}
+
+// ClearCookies 清空默认 Cookie 和 Cookie Jar。
+func (c *Client) ClearCookies() *Client {
+	jar, _ := cookiejar.New(nil)
+	c.mu.Lock()
+	c.cookies = make(map[string]string)
+	c.observedCookies = make(map[string]string)
+	c.jar = jar
+	c.mu.Unlock()
+	return c
+}
+
+// ClearHeaders 清空默认请求头。
+func (c *Client) ClearHeaders() *Client {
+	c.mu.Lock()
+	c.headers = make(map[string]string)
+	c.mu.Unlock()
+	return c
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	result := make(map[string]string, len(values))
+	for key, value := range values {
+		result[key] = value
 	}
 	return result
-}
-
-// ClearCookies 清空Cookie
-func (c *Client) ClearCookies() *Client {
-	c.cookies = make(map[string]string)
-	jar, _ := cookiejar.New(nil)
-	c.jar = jar
-	c.httpClient.Jar = jar
-	return c
-}
-
-// ClearHeaders 清空默认请求头
-func (c *Client) ClearHeaders() *Client {
-	c.headers = make(map[string]string)
-	return c
 }

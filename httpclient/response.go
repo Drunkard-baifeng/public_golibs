@@ -7,12 +7,12 @@ import (
 
 // Response HTTP响应
 type Response struct {
-	StatusCode int               // 状态码
-	Status     string            // 状态描述
-	Headers    http.Header       // 响应头
-	Cookies    []*http.Cookie    // 响应Cookie
-	Body       []byte            // 响应体
-	Request    *http.Request     // 原始请求
+	StatusCode int            // 状态码
+	Status     string         // 状态描述
+	Headers    http.Header    // 响应头
+	Cookies    []*http.Cookie // 响应Cookie
+	Body       []byte         // 响应体
+	Request    *http.Request  // 原始请求
 }
 
 // Text 获取响应文本
@@ -111,4 +111,3 @@ func (r *Response) ContentLength() int {
 func (r *Response) Location() string {
 	return r.Headers.Get("Location")
 }
-
