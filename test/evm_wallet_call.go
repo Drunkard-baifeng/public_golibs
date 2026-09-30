@@ -3,14 +3,14 @@ package main
 import (
 	"fmt"
 
-	"github.com/Drunkard-baifeng/public_golibs/web3utils"
+	"github.com/Drunkard-baifeng/public_golibs/web3utils/evm"
 )
 
 func Web3UtilsCall() {
-	evm := web3utils.NewEVMWallet("", 0)
-	defer evm.Close()
+	walletClient := evm.NewEVMWallet("", 0)
+	defer walletClient.Close()
 
-	// ok, wallet, msg := evm.GenerateWallet(0)
+	// ok, wallet, msg := walletClient.GenerateWallet(0)
 	// if !ok {
 	// 	fmt.Println("GenerateWallet failed:", msg)
 	// 	return
@@ -20,14 +20,14 @@ func Web3UtilsCall() {
 	// fmt.Println("mnemonic:", wallet.Mnemonic)
 
 	// mnemonic := "tiger jelly liberty tree obvious prevent desk hint sentence onion lady display"
-	// ok, walletByMnemonic, msg := evm.RecoverWalletFromMnemonic(mnemonic, 0)
+	// ok, walletByMnemonic, msg := walletClient.RecoverWalletFromMnemonic(mnemonic, 0)
 	// if !ok {
 	// 	fmt.Println("RecoverWalletFromMnemonic failed:", msg)
 	// 	return
 	// }
 	// fmt.Println("recover by mnemonic:", walletByMnemonic.Address)
 
-	// ok, walletByPrivate, msg := evm.RecoverWalletFromPrivateKey(walletByMnemonic.PrivateKey)
+	// ok, walletByPrivate, msg := walletClient.RecoverWalletFromPrivateKey(walletByMnemonic.PrivateKey)
 	// if !ok {
 	// 	fmt.Println("RecoverWalletFromPrivateKey failed:", msg)
 	// 	return
@@ -36,7 +36,7 @@ func Web3UtilsCall() {
 	// fmt.Println("private:", walletByPrivate.PrivateKey)
 
 	signText := "RichWorld中国"
-	ok, signResult, msg := evm.SignMessage("0xa0cae50832449d0f7d38f7fed002066f1e04b467d782dc5cb908e2100c647997", signText)
+	ok, signResult, msg := walletClient.SignMessage("0xa0cae50832449d0f7d38f7fed002066f1e04b467d782dc5cb908e2100c647997", signText)
 	if !ok {
 		fmt.Println("SignMessage failed:", msg)
 		return
@@ -46,7 +46,7 @@ func Web3UtilsCall() {
 	fmt.Println("signature_s:", signResult.SignatureS)
 	fmt.Println("signature_v:", signResult.SignatureV)
 
-	ok, msg = evm.VerifySignature(signText, signResult.Signature, "0xD63FA832915ec48c837BAab82dFaFf35699C02cb")
+	ok, msg = walletClient.VerifySignature(signText, signResult.Signature, "0xD63FA832915ec48c837BAab82dFaFf35699C02cb")
 	fmt.Println("verify:", ok, msg)
 }
 
@@ -54,11 +54,11 @@ func Web3UtilsOnlineCall() {
 	rpcURL := "https://bsc-dataseed1.binance.org"
 	address := "0xc2b44a674bd4e7d9a50783a85f40744d37049eb4"
 
-	web3utils.InitDefaultEVM(rpcURL, 56)
-	defer func() { _ = web3utils.CloseDefaultEVM() }()
+	evm.InitDefaultEVM(rpcURL, 56)
+	defer func() { _ = evm.CloseDefaultEVM() }()
 
-	ok, balance, msg := web3utils.GetBalanceDefault(address)
-	fmt.Println("connected:", web3utils.DefaultEVM().Connected(), "chain:", web3utils.DefaultEVM().ChainName, web3utils.DefaultEVM().NativeToken)
+	ok, balance, msg := evm.GetBalanceDefault(address)
+	fmt.Println("connected:", evm.DefaultEVM().Connected(), "chain:", evm.DefaultEVM().ChainName, evm.DefaultEVM().NativeToken)
 	fmt.Println("balance:", ok, balance, msg)
 }
 
@@ -67,11 +67,11 @@ func Web3UtilsGetTokenBalanceCall() {
 	userAddress := "0xc2b44a674bd4e7d9a50783a85f40744d37049eb4"
 	tokenContract := "0x55d398326f99059fF775485246999027B3197955" // BSC-USDT
 
-	web3utils.InitDefaultEVM(rpcURL, 56)
-	defer func() { _ = web3utils.CloseDefaultEVM() }()
+	evm.InitDefaultEVM(rpcURL, 56)
+	defer func() { _ = evm.CloseDefaultEVM() }()
 
-	ok, balance, msg := web3utils.GetTokenBalanceDefault(userAddress, tokenContract, "")
-	fmt.Println("connected:", web3utils.DefaultEVM().Connected(), "chain:", web3utils.DefaultEVM().ChainName, web3utils.DefaultEVM().NativeToken)
+	ok, balance, msg := evm.GetTokenBalanceDefault(userAddress, tokenContract, "")
+	fmt.Println("connected:", evm.DefaultEVM().Connected(), "chain:", evm.DefaultEVM().ChainName, evm.DefaultEVM().NativeToken)
 	fmt.Println("token balance:", ok, balance, msg)
 }
 
@@ -86,15 +86,15 @@ func Web3UtilsTransferCoinCall() {
 		return
 	}
 
-	web3utils.InitDefaultEVM(rpcURL, 56)
-	defer func() { _ = web3utils.CloseDefaultEVM() }()
+	evm.InitDefaultEVM(rpcURL, 56)
+	defer func() { _ = evm.CloseDefaultEVM() }()
 
-	opts := web3utils.DefaultTransferCoinOptions()
+	opts := evm.DefaultTransferCoinOptions()
 	opts.WaitForConfirmation = true
 	opts.GasPriceBuffer = 1.2
 	opts.GasLimitBuffer = 1.2
 
-	ok, txHash, msg := web3utils.TransferCoinDefault(privateKey, toAddress, amount, opts)
+	ok, txHash, msg := evm.TransferCoinDefault(privateKey, toAddress, amount, opts)
 	fmt.Println("transfer coin:", ok, txHash, msg)
 }
 
@@ -110,14 +110,14 @@ func Web3UtilsTransferTokenCall() {
 		return
 	}
 
-	web3utils.InitDefaultEVM(rpcURL, 56)
-	defer func() { _ = web3utils.CloseDefaultEVM() }()
+	evm.InitDefaultEVM(rpcURL, 56)
+	defer func() { _ = evm.CloseDefaultEVM() }()
 
-	opts := web3utils.DefaultTransferTokenOptions()
+	opts := evm.DefaultTransferTokenOptions()
 	opts.WaitForConfirmation = true
 	opts.GasPriceBuffer = 1.2
 	opts.GasLimitBuffer = 1.2
 
-	ok, txHash, msg := web3utils.TransferTokenDefault(privateKey, toAddress, amount, tokenContract, opts)
+	ok, txHash, msg := evm.TransferTokenDefault(privateKey, toAddress, amount, tokenContract, opts)
 	fmt.Println("transfer token:", ok, txHash, msg)
 }

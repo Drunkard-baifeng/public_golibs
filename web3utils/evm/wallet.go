@@ -1,4 +1,6 @@
-package web3utils
+// Package evm provides wallet, signing, balance, and transfer utilities for
+// Ethereum-compatible chains.
+package evm
 
 import (
 	"context"
