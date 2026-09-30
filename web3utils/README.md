@@ -12,6 +12,10 @@ web3utils/
 │   ├── history.go       # TronGrid TRX/TRC20 历史记录查询
 │   ├── singleton.go     # 默认 TRON 客户端及便捷方法
 │   └── wallet_test.go   # 离线钱包及签名单元测试
+├── solana/              # Solana/SPL Token/Token-2022
+│   ├── wallet.go        # 钱包、签名、余额、SOL/SPL 转账和交易确认
+│   ├── singleton.go     # 默认 Solana 客户端及便捷方法
+│   └── wallet_test.go   # 离线钱包、签名和金额转换测试
 ├── go.mod
 └── go.sum
 ```
@@ -46,5 +50,19 @@ defer wallet.Close()
 ok, account, message := wallet.GenerateWallet(0)
 ```
 
-> `gotron-sdk v0.26.0` 要求 Go 1.24 或更高版本。仓库目前仍保留
-> `go 1.23.2`，因此需要升级 Go 后才能直接构建 `tron` 子包。
+Solana：
+
+```go
+import "github.com/Drunkard-baifeng/public_golibs/web3utils/solana"
+
+wallet := solana.NewSolanaWallet("https://api.mainnet-beta.solana.com")
+defer wallet.Close()
+
+ok, account, message := wallet.GenerateWallet(0)
+```
+
+`solana` 使用 `github.com/solana-foundation/solana-go/v2`，支持 SOL、SPL
+Token 和普通 Token-2022 转账。Token-2022 的 confidential transfer、transfer
+hook 等需要额外账户或零知识证明的扩展不包含在通用 `TransferToken` 中。
+
+> 当前模块最低要求 Go 1.25。
