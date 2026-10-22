@@ -13,6 +13,7 @@ import (
 	fhttp "github.com/bogdanfinn/fhttp"
 	"github.com/bogdanfinn/fhttp/cookiejar"
 	tlsclient "github.com/bogdanfinn/tls-client"
+	"golang.org/x/net/publicsuffix"
 )
 
 const (
@@ -27,7 +28,9 @@ const (
 // Config configures a Client. An empty Profile randomly selects a built-in
 // browser profile once and keeps it stable for the lifetime of the Client.
 type Config struct {
-	Timeout                 time.Duration
+	Timeout time.Duration
+	// ProxyHandshakeTimeout bounds tunnel setup only, never the response stream.
+	ProxyHandshakeTimeout   time.Duration
 	MaxRedirects            int
 	Verify                  *bool
 	Proxy                   string
@@ -61,6 +64,7 @@ type Client struct {
 
 	profile                 Profile
 	timeout                 time.Duration
+	proxyHandshakeTimeout   time.Duration
 	maxRedirects            int
 	verify                  bool
 	proxyURL                string
@@ -139,7 +143,7 @@ func newClient(config Config) (*Client, error) {
 	}
 	client.proxyURL = proxyURL
 
-	jar, err := cookiejar.New(nil)
+	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	if err != nil {
 		return client, fmt.Errorf("create cookie jar: %w", err)
 	}
@@ -171,6 +175,10 @@ func newClientShell(config Config) *Client {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
+	proxyHandshakeTimeout := config.ProxyHandshakeTimeout
+	if proxyHandshakeTimeout <= 0 {
+		proxyHandshakeTimeout = defaultTimeout
+	}
 	maxRedirects := config.MaxRedirects
 	if maxRedirects <= 0 {
 		maxRedirects = defaultMaxRedirects
@@ -197,6 +205,7 @@ func newClientShell(config Config) *Client {
 	}
 	return &Client{
 		timeout:                 timeout,
+		proxyHandshakeTimeout:   proxyHandshakeTimeout,
 		maxRedirects:            maxRedirects,
 		verify:                  verify,
 		browserHeaders:          browserHeaders,
@@ -218,7 +227,7 @@ func newClientShell(config Config) *Client {
 
 func (c *Client) rebuildLocked() error {
 	if c.jar == nil {
-		jar, err := cookiejar.New(nil)
+		jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 		if err != nil {
 			return fmt.Errorf("create cookie jar: %w", err)
 		}
@@ -249,7 +258,8 @@ func (c *Client) rebuildLocked() error {
 	if c.randomTLSExtensionOrder {
 		options = append(options, tlsclient.WithRandomTLSExtensionOrder())
 	}
-	if !c.enableHTTP3 {
+	// UDP/HTTP3 racing cannot use the TCP proxy tunnel. Never bypass it.
+	if !c.enableHTTP3 || c.proxyURL != "" {
 		options = append(options, tlsclient.WithDisableHttp3())
 	} else if c.enableProtocolRacing {
 		options = append(options, tlsclient.WithProtocolRacing())
@@ -258,7 +268,11 @@ func (c *Client) rebuildLocked() error {
 		options = append(options, tlsclient.WithInsecureSkipVerify())
 	}
 	if c.proxyURL != "" {
-		options = append(options, tlsclient.WithProxyUrl(c.proxyURL))
+		dialer, err := newProxyDialer(c.proxyURL, c.proxyHandshakeTimeout)
+		if err != nil {
+			return err
+		}
+		options = append(options, tlsclient.WithDialContext(dialer.DialContext))
 	}
 
 	inner, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
@@ -455,7 +469,7 @@ func (c *Client) GetCookies() map[string]string {
 }
 
 func (c *Client) ClearCookies() *Client {
-	jar, err := cookiejar.New(nil)
+	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err != nil {

@@ -6,12 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime"
-	"mime/multipart"
+	"math"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -20,14 +17,25 @@ import (
 
 // Options contains settings for one request.
 type Options struct {
-	Params         map[string]string
-	Headers        map[string]string
-	HeaderValues   http.Header
-	HeaderOrder    []string
-	Cookies        map[string]string
-	Timeout        time.Duration
-	AllowRedirects *bool
-	BrowserMode    BrowserMode
+	Params       map[string]string
+	Headers      map[string]string
+	HeaderValues http.Header
+	HeaderOrder  []string
+	Cookies      map[string]string
+	Timeout      time.Duration
+	// ContentLength preserves a known reader upload size. Nil lets the request
+	// infer its size; -1 means unknown. Zero with a non-nil body is unknown, as
+	// in net/http. The transport checks a positive length against bytes sent.
+	ContentLength *int64
+	// DisableTimeout disables the client's total timeout; ctx still applies.
+	DisableTimeout bool
+	// HeaderTimeout bounds each exchange through receipt of response headers,
+	// including connection establishment and request upload.
+	HeaderTimeout time.Duration
+	// ReadIdleTimeout bounds one blocked Body.Read, not consumer processing time.
+	ReadIdleTimeout time.Duration
+	AllowRedirects  *bool
+	BrowserMode     BrowserMode
 }
 
 // FileField describes one multipart file field.
@@ -44,7 +52,7 @@ func (c *Client) Get(target string, options *Options) (*Response, error) {
 }
 
 func (c *Client) GetContext(ctx context.Context, target string, options *Options) (*Response, error) {
-	return c.doRequest(ctx, http.MethodGet, target, nil, options)
+	return c.Do(ctx, http.MethodGet, target, nil, options)
 }
 
 func (c *Client) Post(target string, body any, options *Options) (*Response, error) {
@@ -52,27 +60,27 @@ func (c *Client) Post(target string, body any, options *Options) (*Response, err
 }
 
 func (c *Client) PostContext(ctx context.Context, target string, body any, options *Options) (*Response, error) {
-	return c.doRequest(ctx, http.MethodPost, target, body, options)
+	return c.Do(ctx, http.MethodPost, target, body, options)
 }
 
 func (c *Client) Put(target string, body any, options *Options) (*Response, error) {
-	return c.doRequest(context.Background(), http.MethodPut, target, body, options)
+	return c.Do(context.Background(), http.MethodPut, target, body, options)
 }
 
 func (c *Client) Delete(target string, options *Options) (*Response, error) {
-	return c.doRequest(context.Background(), http.MethodDelete, target, nil, options)
+	return c.Do(context.Background(), http.MethodDelete, target, nil, options)
 }
 
 func (c *Client) Patch(target string, body any, options *Options) (*Response, error) {
-	return c.doRequest(context.Background(), http.MethodPatch, target, body, options)
+	return c.Do(context.Background(), http.MethodPatch, target, body, options)
 }
 
 func (c *Client) Head(target string, options *Options) (*Response, error) {
-	return c.doRequest(context.Background(), http.MethodHead, target, nil, options)
+	return c.Do(context.Background(), http.MethodHead, target, nil, options)
 }
 
 func (c *Client) Options(target string, options *Options) (*Response, error) {
-	return c.doRequest(context.Background(), http.MethodOptions, target, nil, options)
+	return c.Do(context.Background(), http.MethodOptions, target, nil, options)
 }
 
 func (c *Client) PostJSON(target string, data any, options *Options) (*Response, error) {
@@ -81,11 +89,11 @@ func (c *Client) PostJSON(target string, data any, options *Options) (*Response,
 		return nil, fmt.Errorf("marshal JSON body: %w", err)
 	}
 	options = cloneOptions(options)
-	options.Headers["Content-Type"] = "application/json"
+	setContentType(options, "application/json")
 	if options.BrowserMode == "" {
 		options.BrowserMode = BrowserModeJSON
 	}
-	return c.doRequest(context.Background(), http.MethodPost, target, raw, options)
+	return c.Do(context.Background(), http.MethodPost, target, raw, options)
 }
 
 func (c *Client) PostForm(target string, data map[string]string, options *Options) (*Response, error) {
@@ -94,8 +102,8 @@ func (c *Client) PostForm(target string, data map[string]string, options *Option
 		values.Set(key, value)
 	}
 	options = cloneOptions(options)
-	options.Headers["Content-Type"] = "application/x-www-form-urlencoded"
-	return c.doRequest(context.Background(), http.MethodPost, target, []byte(values.Encode()), options)
+	setContentType(options, "application/x-www-form-urlencoded")
+	return c.Do(context.Background(), http.MethodPost, target, []byte(values.Encode()), options)
 }
 
 func (c *Client) PostBytes(target string, data []byte, options *Options) (*Response, error) {
@@ -103,58 +111,11 @@ func (c *Client) PostBytes(target string, data []byte, options *Options) (*Respo
 	if options.Headers["Content-Type"] == "" {
 		options.Headers["Content-Type"] = "application/octet-stream"
 	}
-	return c.doRequest(context.Background(), http.MethodPost, target, data, options)
+	return c.Do(context.Background(), http.MethodPost, target, data, options)
 }
 
 func (c *Client) PostMultipart(target string, fields map[string]string, files []FileField, options *Options) (*Response, error) {
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	for name, value := range fields {
-		if err := writer.WriteField(name, value); err != nil {
-			return nil, fmt.Errorf("write multipart field: %w", err)
-		}
-	}
-	for _, file := range files {
-		data := file.Data
-		if file.FilePath != "" {
-			var err error
-			data, err = os.ReadFile(file.FilePath)
-			if err != nil {
-				return nil, fmt.Errorf("read multipart file: %w", err)
-			}
-			if file.FileName == "" {
-				file.FileName = filepath.Base(file.FilePath)
-			}
-		}
-		if file.FieldName == "" {
-			file.FieldName = "file"
-		}
-		if file.FileName == "" {
-			file.FileName = "file"
-		}
-		if file.ContentType == "" {
-			file.ContentType = "application/octet-stream"
-		}
-		disposition := mime.FormatMediaType("form-data", map[string]string{
-			"name": file.FieldName, "filename": file.FileName,
-		})
-		part, err := writer.CreatePart(map[string][]string{
-			"Content-Disposition": {disposition},
-			"Content-Type":        {file.ContentType},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("create multipart file field: %w", err)
-		}
-		if _, err := part.Write(data); err != nil {
-			return nil, fmt.Errorf("write multipart file: %w", err)
-		}
-	}
-	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("close multipart writer: %w", err)
-	}
-	options = cloneOptions(options)
-	options.Headers["Content-Type"] = writer.FormDataContentType()
-	return c.doRequest(context.Background(), http.MethodPost, target, body.Bytes(), options)
+	return c.PostMultipartContext(context.Background(), target, fields, files, options)
 }
 
 func (c *Client) PostFile(target, fieldName, filePath string, options *Options) (*Response, error) {
@@ -166,31 +127,73 @@ func cloneOptions(options *Options) *Options {
 		return &Options{Headers: make(map[string]string)}
 	}
 	result := &Options{
-		Params:       cloneStringMap(options.Params),
-		Headers:      cloneHeaderMap(options.Headers),
-		HeaderValues: options.HeaderValues.Clone(),
-		HeaderOrder:  append([]string(nil), options.HeaderOrder...),
-		Cookies:      cloneStringMap(options.Cookies),
-		Timeout:      options.Timeout,
-		BrowserMode:  options.BrowserMode,
+		Params:          cloneStringMap(options.Params),
+		Headers:         cloneHeaderMap(options.Headers),
+		HeaderValues:    options.HeaderValues.Clone(),
+		HeaderOrder:     append([]string(nil), options.HeaderOrder...),
+		Cookies:         cloneStringMap(options.Cookies),
+		Timeout:         options.Timeout,
+		DisableTimeout:  options.DisableTimeout,
+		HeaderTimeout:   options.HeaderTimeout,
+		ReadIdleTimeout: options.ReadIdleTimeout,
+		BrowserMode:     options.BrowserMode,
 	}
 	if options.AllowRedirects != nil {
 		allow := *options.AllowRedirects
 		result.AllowRedirects = &allow
 	}
+	if options.ContentLength != nil {
+		length := *options.ContentLength
+		result.ContentLength = &length
+	}
 	return result
 }
 
-func (c *Client) doRequest(ctx context.Context, method, target string, body any, options *Options) (*Response, error) {
+// Body-encoding helpers own Content-Type, including multi-value overrides.
+// options must be cloned before calling this helper.
+func setContentType(options *Options, value string) {
+	for key := range options.HeaderValues {
+		if strings.EqualFold(key, "Content-Type") {
+			delete(options.HeaderValues, key)
+		}
+	}
+	options.Headers["Content-Type"] = value
+}
+
+// Do performs a bounded, buffered request. For SSE or large files use DoStream.
+func (c *Client) Do(ctx context.Context, method, target string, body any, options *Options) (*Response, error) {
+	response, err := c.DoStream(ctx, method, target, body, options)
+	if err != nil {
+		return nil, err
+	}
+	return c.bufferResponse(response)
+}
+
+// DoStream returns after response headers arrive. The caller MUST close Body.
+// Reader bodies are not buffered. A non-replayable body is not resent on 307/308;
+// the redirect response is returned instead. No application-level retry occurs.
+// An io.ReadCloser body is owned by the client and closed even on setup errors.
+func (c *Client) DoStream(ctx context.Context, method, target string, body any, options *Options) (*StreamResponse, error) {
+	// Until a request reaches the transport, this method owns its upload body.
+	// Track replay bodies too, so a later request-construction error closes them.
+	pendingBody, _ := body.(io.ReadCloser)
+	defer func() {
+		if pendingBody != nil {
+			pendingBody.Close()
+		}
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	options = cloneOptions(options)
+	if options.ContentLength != nil && *options.ContentLength < -1 {
+		return nil, fmt.Errorf("content length must be -1 or non-negative")
+	}
 	parsedTarget, err := addQueryParams(target, options.Params)
 	if err != nil {
 		return nil, err
 	}
-	bodyBytes, err := requestBodyBytes(body)
+	bodyReader, err := requestBodyReader(body)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +210,6 @@ func (c *Client) doRequest(ctx context.Context, method, target string, body any,
 	browserHeaders := c.browserHeaders
 	timeout := c.timeout
 	maxRedirects := c.maxRedirects
-	maxBodyBytes := c.maxResponseBodyBytes
 	configErr := c.configErr
 	closed := c.closed
 	c.mu.RUnlock()
@@ -223,11 +225,18 @@ func (c *Client) doRequest(ctx context.Context, method, target string, body any,
 	if options.Timeout > 0 {
 		timeout = options.Timeout
 	}
-	if timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
+	var cancelTotal context.CancelFunc = func() {}
+	if timeout > 0 && !options.DisableTimeout {
+		ctx, cancelTotal = context.WithTimeout(ctx, timeout)
 	}
+	ctx, cancelCause := context.WithCancelCause(ctx)
+	transferred := false
+	cleanup := func() { cancelCause(context.Canceled); cancelTotal() }
+	defer func() {
+		if !transferred {
+			cleanup()
+		}
+	}()
 
 	headers := make(fhttp.Header, len(defaultHeaders)+len(options.HeaderValues)+8)
 	for key, value := range defaultHeaders {
@@ -270,7 +279,9 @@ func (c *Client) doRequest(ctx context.Context, method, target string, body any,
 
 	currentURL := parsedTarget
 	currentMethod := method
-	currentBody := bodyBytes
+	currentBody := bodyReader
+	var replayBody func() (io.ReadCloser, error)
+	var contentLength int64
 	initialURL, _ := url.Parse(currentURL)
 	redirects := 0
 	for {
@@ -283,9 +294,26 @@ func (c *Client) doRequest(ctx context.Context, method, target string, body any,
 		if err != nil {
 			return nil, err
 		}
+		if redirects == 0 {
+			if options.ContentLength != nil {
+				request.ContentLength = *options.ContentLength
+			}
+			replayBody, contentLength = request.GetBody, request.ContentLength
+		} else if currentBody != nil {
+			request.GetBody, request.ContentLength = replayBody, contentLength
+		}
+		stopHeaderTimer := startCancelTimer(options.HeaderTimeout, cancelCause, ErrHeaderTimeout)
+		pendingBody = nil // The transport now owns request.Body.
 		response, err := inner.Do(request)
+		stopHeaderTimer()
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
 		if err != nil {
-			return nil, fmt.Errorf("request %s %s: %w", currentMethod, currentURL, err)
+			if response != nil && response.Body != nil {
+				response.Body.Close()
+			}
+			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
 		responseCookies := response.Cookies()
 		if len(responseCookies) > 0 {
@@ -299,22 +327,37 @@ func (c *Client) doRequest(ctx context.Context, method, target string, body any,
 		}
 
 		location := strings.TrimSpace(response.Header.Get("Location"))
+		nextMethod, preserveBody := redirectMethod(currentMethod, response.StatusCode)
+		cannotReplay := preserveBody && request.Body != nil && request.Body != fhttp.NoBody && request.GetBody == nil
 		if !allowRedirects || !isRedirectStatus(response.StatusCode) || location == "" || redirects >= maxRedirects {
-			return buildResponse(response, request, maxBodyBytes)
+			transferred = true
+			return buildStreamResponse(response, request, ctx, cancelCause, cleanup, options.ReadIdleTimeout), nil
+		}
+		if cannotReplay {
+			transferred = true
+			return buildStreamResponse(response, request, ctx, cancelCause, cleanup, options.ReadIdleTimeout), nil
 		}
 		nextURL, err := resolveRedirectURL(currentURL, location)
 		if err != nil {
 			response.Body.Close()
 			return nil, err
 		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
+		// Do not drain an untrusted redirect body: it can be an endless stream.
 		response.Body.Close()
 
-		nextMethod, preserveBody := redirectMethod(currentMethod, response.StatusCode)
 		if !preserveBody {
 			currentBody = nil
+			replayBody, contentLength = nil, 0
 			headers.Del("Content-Type")
 			headers.Del("Content-Length")
+		} else if request.GetBody != nil {
+			currentBody, err = request.GetBody()
+			if err != nil {
+				return nil, fmt.Errorf("reopen request body: %w", err)
+			}
+			pendingBody, _ = currentBody.(io.ReadCloser)
+		} else {
+			currentBody = nil
 		}
 		nextParsed, _ := url.Parse(nextURL)
 		if !canForwardSensitiveHeaders(initialURL, nextParsed) {
@@ -335,12 +378,8 @@ func (c *Client) doRequest(ctx context.Context, method, target string, body any,
 	}
 }
 
-func newFHTTPRequest(ctx context.Context, method, target string, body []byte, headers fhttp.Header, cookies []*fhttp.Cookie) (*fhttp.Request, error) {
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-	request, err := fhttp.NewRequestWithContext(ctx, method, target, reader)
+func newFHTTPRequest(ctx context.Context, method, target string, body io.Reader, headers fhttp.Header, cookies []*fhttp.Cookie) (*fhttp.Request, error) {
+	request, err := fhttp.NewRequestWithContext(ctx, method, target, body)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -369,30 +408,12 @@ func mergeRequestCookies(jarCookies []*fhttp.Cookie, overrides map[string]string
 	return result
 }
 
-func buildResponse(response *fhttp.Response, request *fhttp.Request, maxBodyBytes int64) (*Response, error) {
-	defer response.Body.Close()
-	body, err := readResponseBody(response.Body, maxBodyBytes)
-	if err != nil {
-		return nil, err
-	}
-	requestSnapshot, _ := http.NewRequest(request.Method, request.URL.String(), nil)
-	requestSnapshot.Header = toStandardHeader(request.Header)
-	return &Response{
-		StatusCode:       response.StatusCode,
-		Status:           response.Status,
-		Proto:            response.Proto,
-		Headers:          toStandardHeader(response.Header),
-		Cookies:          toStandardCookies(response.Cookies()),
-		Body:             body,
-		Request:          requestSnapshot,
-		URL:              request.URL.String(),
-		TransferEncoding: append([]string(nil), response.TransferEncoding...),
-		Uncompressed:     response.Uncompressed,
-	}, nil
-}
-
 func readResponseBody(reader io.Reader, maxBytes int64) ([]byte, error) {
-	body, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))
+	readLimit := maxBytes
+	if readLimit < math.MaxInt64 {
+		readLimit++
+	}
+	body, err := io.ReadAll(io.LimitReader(reader, readLimit))
 	if err != nil {
 		return nil, fmt.Errorf("read response body: %w", err)
 	}
@@ -413,6 +434,10 @@ func (c *Client) observeCookies(cookies []*fhttp.Cookie) {
 }
 
 func addQueryParams(target string, params map[string]string) (string, error) {
+	// Preserve signed URLs byte-for-byte when no query changes were requested.
+	if len(params) == 0 {
+		return target, nil
+	}
 	parsedURL, err := url.Parse(target)
 	if err != nil {
 		return "", fmt.Errorf("parse request URL: %w", err)
@@ -425,28 +450,22 @@ func addQueryParams(target string, params map[string]string) (string, error) {
 	return parsedURL.String(), nil
 }
 
-func requestBodyBytes(body any) ([]byte, error) {
+func requestBodyReader(body any) (io.Reader, error) {
 	switch value := body.(type) {
 	case nil:
 		return nil, nil
 	case []byte:
-		return append([]byte(nil), value...), nil
+		return bytes.NewReader(value), nil
 	case string:
-		return []byte(value), nil
-	case *bytes.Buffer:
-		return append([]byte(nil), value.Bytes()...), nil
+		return strings.NewReader(value), nil
 	case io.Reader:
-		current, err := io.ReadAll(value)
-		if err != nil {
-			return nil, fmt.Errorf("read request body: %w", err)
-		}
-		return current, nil
+		return value, nil
 	default:
 		current, err := json.Marshal(value)
 		if err != nil {
 			return nil, fmt.Errorf("marshal request body: %w", err)
 		}
-		return current, nil
+		return bytes.NewReader(current), nil
 	}
 }
 
@@ -466,6 +485,7 @@ func redirectMethod(method string, statusCode int) (string, bool) {
 		if method != http.MethodGet && method != http.MethodHead {
 			return http.MethodGet, false
 		}
+		return method, false
 	}
 	return method, true
 }
@@ -488,7 +508,17 @@ func canForwardSensitiveHeaders(initial, target *url.URL) bool {
 	}
 	initialHost := strings.ToLower(strings.TrimSuffix(initial.Hostname(), "."))
 	targetHost := strings.ToLower(strings.TrimSuffix(target.Hostname(), "."))
-	return targetHost == initialHost || strings.HasSuffix(targetHost, "."+initialHost)
+	return targetHost == initialHost && initial.Scheme == target.Scheme && effectivePort(initial) == effectivePort(target)
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if u.Scheme == "https" {
+		return "443"
+	}
+	return "80"
 }
 
 func setReferer(headers fhttp.Header, previousURL, nextURL string) {
