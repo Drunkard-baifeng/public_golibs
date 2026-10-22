@@ -97,9 +97,6 @@ func New() *Client { return NewWithConfig(Config{}) }
 // NewWithConfig creates a client and stores construction errors on the Client.
 func NewWithConfig(config Config) *Client {
 	client, err := newClient(config)
-	if client == nil {
-		client = newClientShell(config)
-	}
 	client.configErr = err
 	return client
 }
@@ -108,9 +105,7 @@ func NewWithConfig(config Config) *Client {
 func NewClient(config Config) (*Client, error) {
 	client, err := newClient(config)
 	if err != nil {
-		if client != nil {
-			client.Close()
-		}
+		client.Close()
 		return nil, err
 	}
 	return client, nil
@@ -143,11 +138,6 @@ func newClient(config Config) (*Client, error) {
 	}
 	client.proxyURL = proxyURL
 
-	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
-	if err != nil {
-		return client, fmt.Errorf("create cookie jar: %w", err)
-	}
-	client.jar = jar
 	if err := client.rebuildLocked(); err != nil {
 		return client, err
 	}
@@ -346,7 +336,11 @@ func (c *Client) SetVerify(verify bool) *Client {
 		return c
 	}
 	c.verify = verify
-	c.configErr = c.rebuildLocked()
+	// A TLS setting must not clear an invalid proxy configuration and silently
+	// enable direct requests. ConfigureProxy/ClearProxy explicitly recover it.
+	if c.configErr == nil {
+		c.configErr = c.rebuildLocked()
+	}
 	return c
 }
 
@@ -566,7 +560,8 @@ func normalizeProxyURL(proxyValue, proxyType string) (string, error) {
 	}
 	parsedURL, err := url.Parse(proxyValue)
 	if err != nil {
-		return "", fmt.Errorf("parse proxy: %w", err)
+		// url.Parse errors embed the original URL, including proxy credentials.
+		return "", fmt.Errorf("invalid proxy URL")
 	}
 	switch strings.ToLower(parsedURL.Scheme) {
 	case "http", "https", "socks5", "socks5h":

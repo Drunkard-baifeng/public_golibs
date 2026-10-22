@@ -130,13 +130,15 @@ func cloneOptions(options *Options) *Options {
 		Params:          cloneStringMap(options.Params),
 		Headers:         cloneHeaderMap(options.Headers),
 		HeaderValues:    options.HeaderValues.Clone(),
-		HeaderOrder:     append([]string(nil), options.HeaderOrder...),
 		Cookies:         cloneStringMap(options.Cookies),
 		Timeout:         options.Timeout,
 		DisableTimeout:  options.DisableTimeout,
 		HeaderTimeout:   options.HeaderTimeout,
 		ReadIdleTimeout: options.ReadIdleTimeout,
-		BrowserMode:     options.BrowserMode,
+		BrowserMode:     BrowserMode(strings.ToLower(strings.TrimSpace(string(options.BrowserMode)))),
+	}
+	if options.HeaderOrder != nil {
+		result.HeaderOrder = append([]string{}, options.HeaderOrder...)
 	}
 	if options.AllowRedirects != nil {
 		allow := *options.AllowRedirects
@@ -201,7 +203,7 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 	c.mu.RLock()
 	inner := c.inner
 	jar := c.jar
-	defaultHeaders := cloneHeaderMap(c.headers)
+	defaultHeaders := cloneStringMap(c.headers)
 	defaultHeaderOrder := append([]string(nil), c.headerOrder...)
 	customHeaderOrder := c.customHeaderOrder
 	defaultCookies := cloneStringMap(c.cookies)
@@ -248,12 +250,13 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 	for key, values := range options.HeaderValues {
 		headers[http.CanonicalHeaderKey(key)] = append([]string(nil), values...)
 	}
+	browserState := newBrowserHeaderState(headers, options.BrowserMode, parsedTarget)
 	profile.UserAgent = userAgent
 	if browserHeaders {
 		if err := applyBrowserHeaders(headers, profile, options.BrowserMode, parsedTarget); err != nil {
 			return nil, err
 		}
-	} else if headers.Get("User-Agent") == "" && userAgent != "" {
+	} else if !headerExists(headers, "User-Agent") && userAgent != "" {
 		headers.Set("User-Agent", userAgent)
 	}
 	headerOrder := defaultHeaderOrder
@@ -262,14 +265,19 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 	} else if !customHeaderOrder {
 		headerOrder = nil
 	}
+	explicitHeaderOrder := customHeaderOrder
 	if configuredOrder, exists := headers[fhttp.HeaderOrderKey]; exists {
+		explicitHeaderOrder = true
 		headerOrder = normalizeHeaderOrder(configuredOrder)
 	}
 	if options.HeaderOrder != nil {
+		explicitHeaderOrder = true
 		headerOrder = normalizeHeaderOrder(options.HeaderOrder)
 	}
 	if len(headerOrder) > 0 {
 		headers[fhttp.HeaderOrderKey] = append([]string(nil), headerOrder...)
+	} else {
+		delete(headers, fhttp.HeaderOrderKey)
 	}
 	explicitCookies := defaultCookies
 	for name, value := range options.Cookies {
@@ -282,25 +290,33 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 	currentBody := bodyReader
 	var replayBody func() (io.ReadCloser, error)
 	var contentLength int64
-	initialURL, _ := url.Parse(currentURL)
+	var initialURL *url.URL
 	redirects := 0
 	for {
-		requestURL, err := url.Parse(currentURL)
+		request, err := fhttp.NewRequestWithContext(ctx, currentMethod, currentURL, currentBody)
 		if err != nil {
-			return nil, fmt.Errorf("parse request URL: %w", err)
+			return nil, fmt.Errorf("create request: %w", err)
 		}
-		requestCookies := mergeRequestCookies(jar.Cookies(requestURL), explicitCookies)
-		request, err := newFHTTPRequest(ctx, currentMethod, currentURL, currentBody, headers, requestCookies)
-		if err != nil {
-			return nil, err
+		request.Header = headers.Clone()
+		for _, cookie := range mergeRequestCookies(jar.Cookies(request.URL), explicitCookies) {
+			request.AddCookie(cookie)
 		}
 		if redirects == 0 {
+			initialURL = request.URL
 			if options.ContentLength != nil {
+				length := *options.ContentLength
+				knownLength := request.Body == nil || request.Body == fhttp.NoBody || request.GetBody != nil
+				if length > 0 && knownLength && request.ContentLength != length {
+					return nil, fmt.Errorf("Content-Length %d does not match upload size %d", length, request.ContentLength)
+				}
 				request.ContentLength = *options.ContentLength
 			}
 			replayBody, contentLength = request.GetBody, request.ContentLength
 		} else if currentBody != nil {
 			request.GetBody, request.ContentLength = replayBody, contentLength
+		}
+		if request.Body != nil && request.Body != fhttp.NoBody {
+			request.Body = newUploadBody(ctx, request.Body, request.ContentLength)
 		}
 		stopHeaderTimer := startCancelTimer(options.HeaderTimeout, cancelCause, ErrHeaderTimeout)
 		pendingBody = nil // The transport now owns request.Body.
@@ -318,7 +334,7 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 		responseCookies := response.Cookies()
 		if len(responseCookies) > 0 {
 			jar.SetCookies(request.URL, responseCookies)
-			c.observeCookies(responseCookies)
+			c.observeCookies(jar, responseCookies)
 			for _, cookie := range responseCookies {
 				if cookie != nil {
 					delete(explicitCookies, cookie.Name)
@@ -367,8 +383,8 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 		}
 		setReferer(headers, currentURL, nextURL)
 		if browserHeaders && options.BrowserMode != BrowserModeOff {
-			updateRedirectBrowserHeaders(headers, options.BrowserMode, nextURL)
-			if options.HeaderOrder == nil && !customHeaderOrder {
+			browserState.redirect(headers, profile, options.BrowserMode, nextURL)
+			if !explicitHeaderOrder {
 				headers[fhttp.HeaderOrderKey] = profileHeaderOrder(profile, options.BrowserMode, true)
 			}
 		}
@@ -376,18 +392,6 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 		currentURL = nextURL
 		redirects++
 	}
-}
-
-func newFHTTPRequest(ctx context.Context, method, target string, body io.Reader, headers fhttp.Header, cookies []*fhttp.Cookie) (*fhttp.Request, error) {
-	request, err := fhttp.NewRequestWithContext(ctx, method, target, body)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	request.Header = headers.Clone()
-	for _, cookie := range cookies {
-		request.AddCookie(cookie)
-	}
-	return request, nil
 }
 
 func mergeRequestCookies(jarCookies []*fhttp.Cookie, overrides map[string]string) []*fhttp.Cookie {
@@ -423,9 +427,12 @@ func readResponseBody(reader io.Reader, maxBytes int64) ([]byte, error) {
 	return body, nil
 }
 
-func (c *Client) observeCookies(cookies []*fhttp.Cookie) {
+func (c *Client) observeCookies(jar fhttp.CookieJar, cookies []*fhttp.Cookie) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.jar != jar {
+		return // ClearCookies detached this in-flight request's cookie store.
+	}
 	for _, cookie := range cookies {
 		if cookie != nil {
 			c.observedCookies[cookie.Name] = cookie.Value

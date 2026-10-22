@@ -24,12 +24,12 @@ const (
 )
 
 func applyBrowserHeaders(headers fhttp.Header, profile Profile, mode BrowserMode, target string) error {
-	mode = BrowserMode(strings.ToLower(strings.TrimSpace(string(mode))))
+	// cloneOptions normalizes the mode before request construction.
 	if mode == "" {
 		mode = BrowserModeIdentity
 	}
 	if mode == BrowserModeOff {
-		if !headerExists(headers, "user-agent") {
+		if !headerExists(headers, "User-Agent") {
 			headers["User-Agent"] = []string{""}
 		}
 		return nil
@@ -40,63 +40,67 @@ func applyBrowserHeaders(headers fhttp.Header, profile Profile, mode BrowserMode
 		return fmt.Errorf("unsupported browser mode %q", mode)
 	}
 
-	setHeaderDefault(headers, "user-agent", profile.UserAgent)
-	setHeaderDefault(headers, "accept-language", profile.AcceptLanguage)
-	setHeaderDefault(headers, "accept-encoding", profile.AcceptEncoding)
-	if profile.SecCHUA != "" && clientHintsAllowed(target) {
-		setHeaderDefault(headers, "sec-ch-ua", profile.SecCHUA)
-		setHeaderDefault(headers, "sec-ch-ua-mobile", boolClientHint(profile.Mobile))
-		setHeaderDefault(headers, "sec-ch-ua-platform", `"`+profile.Platform+`"`)
+	setHeaderDefault(headers, "User-Agent", profile.UserAgent)
+	setHeaderDefault(headers, "Accept-Language", profile.AcceptLanguage)
+	setHeaderDefault(headers, "Accept-Encoding", profile.AcceptEncoding)
+	trustworthy := clientHintsAllowed(target)
+	if profile.SecCHUA != "" && trustworthy {
+		setHeaderDefault(headers, "Sec-Ch-Ua", profile.SecCHUA)
+		setHeaderDefault(headers, "Sec-Ch-Ua-Mobile", boolClientHint(profile.Mobile))
+		setHeaderDefault(headers, "Sec-Ch-Ua-Platform", `"`+profile.Platform+`"`)
 	}
 
 	switch mode {
 	case BrowserModeNavigation:
-		setHeaderDefault(headers, "accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-		setHeaderDefault(headers, "upgrade-insecure-requests", "1")
-		setHeaderDefault(headers, "sec-fetch-mode", "navigate")
-		setHeaderDefault(headers, "sec-fetch-user", "?1")
-		setHeaderDefault(headers, "sec-fetch-dest", "document")
-		setHeaderDefault(headers, "sec-fetch-site", fetchSite(headers.Get("referer"), target, true))
-		setHeaderDefault(headers, "priority", "u=0, i")
+		setHeaderDefault(headers, "Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+		setHeaderDefault(headers, "Upgrade-Insecure-Requests", "1")
+		if trustworthy {
+			setHeaderDefault(headers, "Sec-Fetch-Mode", "navigate")
+			setHeaderDefault(headers, "Sec-Fetch-User", "?1")
+			setHeaderDefault(headers, "Sec-Fetch-Dest", "document")
+			setHeaderDefault(headers, "Sec-Fetch-Site", fetchSite(headers.Get("Referer"), target, true))
+		}
+		setHeaderDefault(headers, "Priority", "u=0, i")
 	case BrowserModeFetch, BrowserModeJSON:
 		if mode == BrowserModeJSON {
-			setHeaderDefault(headers, "accept", "application/json")
+			setHeaderDefault(headers, "Accept", "application/json")
 		} else {
-			setHeaderDefault(headers, "accept", "*/*")
+			setHeaderDefault(headers, "Accept", "*/*")
 		}
-		setHeaderDefault(headers, "sec-fetch-mode", "cors")
-		setHeaderDefault(headers, "sec-fetch-dest", "empty")
-		setHeaderDefault(headers, "sec-fetch-site", fetchSite(requestSource(headers), target, false))
-		setHeaderDefault(headers, "priority", "u=1, i")
+		if trustworthy {
+			setHeaderDefault(headers, "Sec-Fetch-Mode", "cors")
+			setHeaderDefault(headers, "Sec-Fetch-Dest", "empty")
+			setHeaderDefault(headers, "Sec-Fetch-Site", fetchSite(requestSource(headers), target, false))
+		}
+		setHeaderDefault(headers, "Priority", "u=1, i")
 	case BrowserModeScript:
-		setHeaderDefault(headers, "accept", "*/*")
-		setHeaderDefault(headers, "sec-fetch-mode", "no-cors")
-		setHeaderDefault(headers, "sec-fetch-dest", "script")
-		setHeaderDefault(headers, "sec-fetch-site", fetchSite(headers.Get("referer"), target, false))
+		setHeaderDefault(headers, "Accept", "*/*")
+		if trustworthy {
+			setHeaderDefault(headers, "Sec-Fetch-Mode", "no-cors")
+			setHeaderDefault(headers, "Sec-Fetch-Dest", "script")
+			setHeaderDefault(headers, "Sec-Fetch-Site", fetchSite(headers.Get("Referer"), target, false))
+		}
 	}
 	return nil
 }
 
 func headerExists(headers fhttp.Header, key string) bool {
-	for existing := range headers {
-		if strings.EqualFold(existing, key) {
-			return true
-		}
-	}
-	return false
+	// Both public inputs and internal header names use canonical MIME casing.
+	_, exists := headers[key]
+	return exists
 }
 
 func setHeaderDefault(headers fhttp.Header, key, value string) {
-	if value != "" && headers.Get(key) == "" {
+	if value != "" && !headerExists(headers, key) {
 		headers.Set(key, value)
 	}
 }
 
 func requestSource(headers fhttp.Header) string {
-	if value := strings.TrimSpace(headers.Get("origin")); value != "" {
+	if value := strings.TrimSpace(headers.Get("Origin")); value != "" {
 		return value
 	}
-	return strings.TrimSpace(headers.Get("referer"))
+	return strings.TrimSpace(headers.Get("Referer"))
 }
 
 func fetchSite(source, target string, navigation bool) string {
@@ -111,7 +115,7 @@ func fetchSite(source, target string, navigation bool) string {
 	if leftErr != nil || rightErr != nil || left.Hostname() == "" || right.Hostname() == "" {
 		return "cross-site"
 	}
-	if strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Host, right.Host) {
+	if strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Hostname(), right.Hostname()) && effectivePort(left) == effectivePort(right) {
 		return "same-origin"
 	}
 	if strings.EqualFold(left.Scheme, right.Scheme) && registrableDomain(left.Hostname()) == registrableDomain(right.Hostname()) {
@@ -140,8 +144,11 @@ func clientHintsAllowed(target string) bool {
 	if strings.EqualFold(parsed.Scheme, "https") {
 		return true
 	}
-	host := strings.ToLower(parsed.Hostname())
-	return host == "localhost" || net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback()
+	if !strings.EqualFold(parsed.Scheme, "http") {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	return host == "localhost" || strings.HasSuffix(host, ".localhost") || net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback()
 }
 
 func boolClientHint(value bool) string {
@@ -169,7 +176,6 @@ func normalizeHeaderOrder(order []string) []string {
 }
 
 func profileHeaderOrder(profile Profile, mode BrowserMode, redirected bool) []string {
-	mode = BrowserMode(strings.ToLower(strings.TrimSpace(string(mode))))
 	if profile.Browser == "chrome" || profile.Browser == "brave" {
 		switch mode {
 		case BrowserModeNavigation:
@@ -185,21 +191,61 @@ func profileHeaderOrder(profile Profile, mode BrowserMode, redirected bool) []st
 	return append([]string(nil), profile.headerOrder...)
 }
 
-func updateRedirectBrowserHeaders(headers fhttp.Header, mode BrowserMode, nextURL string) {
-	mode = BrowserMode(strings.ToLower(strings.TrimSpace(string(mode))))
-	if mode == "" {
-		mode = BrowserModeIdentity
+var browserContextHeaders = []string{
+	"Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform",
+	"Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Sec-Fetch-User",
+}
+
+// Keep the original initiator and the least-trusted hop across redirects.
+// Generated headers may change with the destination; explicit overrides stay.
+type browserHeaderState struct {
+	source   string
+	site     string
+	explicit map[string]bool
+}
+
+func newBrowserHeaderState(headers fhttp.Header, mode BrowserMode, target string) *browserHeaderState {
+	state := &browserHeaderState{}
+	for _, key := range browserContextHeaders {
+		if headerExists(headers, key) {
+			if state.explicit == nil {
+				state.explicit = make(map[string]bool)
+			}
+			state.explicit[key] = true
+		}
 	}
 	switch mode {
-	case BrowserModeNavigation:
-		headers.Set("sec-fetch-site", fetchSite(headers.Get("referer"), nextURL, true))
+	case BrowserModeNavigation, BrowserModeScript:
+		state.source = headers.Get("Referer")
+		state.site = fetchSite(state.source, target, mode == BrowserModeNavigation)
 	case BrowserModeFetch, BrowserModeJSON:
-		if value := fetchSite(requestSource(headers), nextURL, false); value != "" {
-			headers.Set("sec-fetch-site", value)
+		state.source = requestSource(headers)
+		state.site = fetchSite(state.source, target, false)
+	}
+	return state
+}
+
+func (state *browserHeaderState) redirect(headers fhttp.Header, profile Profile, mode BrowserMode, target string) {
+	switch mode {
+	case BrowserModeNavigation, BrowserModeScript, BrowserModeFetch, BrowserModeJSON:
+		next := fetchSite(state.source, target, mode == BrowserModeNavigation)
+		if state.site != "none" && state.site != "cross-site" {
+			if next == "cross-site" || state.site != "same-site" {
+				state.site = next
+			}
 		}
-	case BrowserModeScript:
-		if value := fetchSite(headers.Get("referer"), nextURL, false); value != "" {
-			headers.Set("sec-fetch-site", value)
+	}
+	for _, key := range browserContextHeaders {
+		if !state.explicit[key] {
+			headers.Del(key)
+		}
+	}
+	// The mode was validated before the first request.
+	_ = applyBrowserHeaders(headers, profile, mode, target)
+	if !state.explicit["Sec-Fetch-Site"] {
+		headers.Del("Sec-Fetch-Site")
+		if state.site != "" && clientHintsAllowed(target) {
+			headers.Set("Sec-Fetch-Site", state.site)
 		}
 	}
 }

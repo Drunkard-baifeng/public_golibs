@@ -103,9 +103,17 @@ func (d *proxyDialer) DialContext(parent context.Context, network, address strin
 		return nil, err
 	}
 	reader := bufio.NewReader(io.LimitReader(conn, 64<<10))
-	response, err := http.ReadResponse(reader, req)
-	if err != nil {
-		return nil, fmt.Errorf("read proxy CONNECT response: %w", err)
+	var response *http.Response
+	for {
+		response, err = http.ReadResponse(reader, req)
+		if err != nil {
+			return nil, fmt.Errorf("read proxy CONNECT response: %w", err)
+		}
+		// Informational responses share the same byte budget and deadline.
+		// 101 is a protocol switch, not a successful CONNECT tunnel.
+		if response.StatusCode < 100 || response.StatusCode >= 200 || response.StatusCode == http.StatusSwitchingProtocols {
+			break
+		}
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, fmt.Errorf("proxy CONNECT returned HTTP %d", response.StatusCode)

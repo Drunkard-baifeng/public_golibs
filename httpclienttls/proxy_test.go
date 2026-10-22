@@ -212,6 +212,61 @@ func TestProxyAcceptsSuccessfulConnectResponses(t *testing.T) {
 	}
 }
 
+func TestProxyCONNECTInformationalResponses(t *testing.T) {
+	for _, tc := range []struct {
+		name, response string
+		wantError      bool
+	}{
+		{"continue", "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n\r\ntunnel", false},
+		{"multiple", "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\nHTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n\r\ntunnel", false},
+		{"switching-protocols", "HTTP/1.1 101 Switching Protocols\r\n\r\n", true},
+		{"header-budget", strings.Repeat("HTTP/1.1 100 Continue\r\n\r\n", 3000) + "HTTP/1.1 200 OK\r\n\r\ntunnel", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				conn.SetDeadline(time.Now().Add(3 * time.Second))
+				req, err := http.ReadRequest(bufio.NewReader(conn))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				req.Body.Close()
+				io.WriteString(conn, tc.response)
+			}()
+			dialer, err := newProxyDialer("http://"+listener.Addr().String(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn, err := dialer.DialContext(context.Background(), "tcp", "fixture.invalid:443")
+			if conn != nil {
+				defer conn.Close()
+			}
+			if tc.wantError {
+				if err == nil {
+					t.Error("invalid or oversized CONNECT response accepted")
+				}
+			} else if err != nil {
+				t.Errorf("valid informational response rejected: %v", err)
+			} else if body, err := io.ReadAll(conn); err != nil || string(body) != "tunnel" {
+				t.Errorf("tunnel bytes=%q err=%v", body, err)
+			}
+			<-done
+		})
+	}
+}
+
 func TestSOCKS5Tunnel(t *testing.T) {
 	for _, scheme := range []string{"socks5", "socks5h"} {
 		t.Run(scheme, func(t *testing.T) {

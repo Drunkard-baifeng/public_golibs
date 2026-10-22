@@ -166,9 +166,9 @@ func TestStreamRedirectReplayPolicy(t *testing.T) {
 		io.Copy(io.Discard, r.Body)
 		switch r.URL.Path {
 		case "/":
-			http.Redirect(w, r, "/again", 307)
+			http.Redirect(w, r, "/again", http.StatusTemporaryRedirect)
 		case "/again":
-			http.Redirect(w, r, "/end", 308)
+			http.Redirect(w, r, "/end", http.StatusPermanentRedirect)
 		default:
 			io.WriteString(w, r.Method)
 		}
@@ -193,7 +193,7 @@ func TestRedirectStripsCredentialsAcrossPortsAndDowngrade(t *testing.T) {
 	}))
 	defer dest.Close()
 	for _, tls := range []bool{false, true} {
-		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, dest.URL, 302) })
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, dest.URL, http.StatusFound) })
 		var src *httptest.Server
 		if tls {
 			src = httptest.NewTLSServer(handler)

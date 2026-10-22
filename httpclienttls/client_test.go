@@ -397,7 +397,8 @@ func TestNavigationRedirectRefreshesBrowserMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	order := response.Request.Header.Values(fhttp.HeaderOrderKey)
-	if response.Text() != "same-origin" || len(order) == 0 || order[0] != "upgrade-insecure-requests" {
+	// A direct navigation keeps its "none" initiator through redirects.
+	if response.Text() != "none" || len(order) == 0 || order[0] != "upgrade-insecure-requests" {
 		t.Fatalf("response=%q order=%v", response.Text(), order)
 	}
 }

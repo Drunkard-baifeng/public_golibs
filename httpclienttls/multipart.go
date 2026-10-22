@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"mime"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -25,35 +24,35 @@ func (c *Client) PostMultipartContext(ctx context.Context, target string, fields
 // PostMultipartStream streams files from disk with bounded buffering. The
 // upload is not replayable; 307/308 responses are returned to the caller.
 func (c *Client) PostMultipartStream(ctx context.Context, target string, fields map[string]string, files []FileField, options *Options) (*StreamResponse, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	fields = cloneStringMap(fields)
 	files = append([]FileField(nil), files...)
+	for name := range fields {
+		if strings.ContainsAny(name, "\r\n") {
+			return nil, fmt.Errorf("invalid multipart field name")
+		}
+	}
 	for _, f := range files {
-		if strings.ContainsAny(f.ContentType, "\r\n") {
-			return nil, fmt.Errorf("invalid multipart content type")
+		name := f.FileName
+		if name == "" && f.FilePath != "" {
+			name = filepath.Base(f.FilePath)
+		}
+		if strings.ContainsAny(f.ContentType+f.FieldName+name, "\r\n") {
+			return nil, fmt.Errorf("invalid multipart file header")
 		}
 	}
 	reader, writer := io.Pipe()
 	mw := multipart.NewWriter(writer)
 	options = cloneOptions(options)
 	setContentType(options, mw.FormDataContentType())
-	// Closing the reader also unblocks a producer when setup/transport fails.
-	stop := context.AfterFunc(ctx, func() { reader.CloseWithError(ctx.Err()) })
+	// DoStream owns the reader, including cancellation and setup errors.
 	go func() {
 		err := writeMultipart(mw, fields, files)
 		if err == nil {
 			err = mw.Close()
 		}
 		writer.CloseWithError(err)
-		stop()
 	}()
-	r, err := c.DoStream(ctx, http.MethodPost, target, reader, options)
-	if err != nil {
-		reader.CloseWithError(err)
-	}
-	return r, err
+	return c.DoStream(ctx, http.MethodPost, target, reader, options)
 }
 
 func writeMultipart(writer *multipart.Writer, fields map[string]string, files []FileField) error {
@@ -97,8 +96,10 @@ func writeMultipartFile(writer *multipart.Writer, file FileField) error {
 	if file.ContentType == "" {
 		file.ContentType = "application/octet-stream"
 	}
+	// Form-data uses quoted UTF-8 names, not RFC 2231 filename* parameters.
+	quote := strings.NewReplacer("\\", "\\\\", "\"", "\\\"")
 	part, err := writer.CreatePart(map[string][]string{
-		"Content-Disposition": {mime.FormatMediaType("form-data", map[string]string{"name": file.FieldName, "filename": file.FileName})},
+		"Content-Disposition": {fmt.Sprintf(`form-data; name="%s"; filename="%s"`, quote.Replace(file.FieldName), quote.Replace(file.FileName))},
 		"Content-Type":        {file.ContentType},
 	})
 	if err != nil {
