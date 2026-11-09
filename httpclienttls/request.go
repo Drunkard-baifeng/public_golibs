@@ -36,6 +36,13 @@ type Options struct {
 	ReadIdleTimeout time.Duration
 	AllowRedirects  *bool
 	BrowserMode     BrowserMode
+	// UserActivated controls automatic Sec-Fetch-User on navigation requests.
+	// Nil preserves the legacy activated-navigation default. False omits the
+	// header; explicit header values (including suppression) take precedence.
+	UserActivated *bool
+	// ClientHintContext supplies the immutable acceptance/policy of a document.
+	// Only response-driven ClientHints mode uses it; explicit headers still win.
+	ClientHintContext *ClientHintContext
 }
 
 // FileField describes one multipart file field.
@@ -127,18 +134,23 @@ func cloneOptions(options *Options) *Options {
 		return &Options{Headers: make(map[string]string)}
 	}
 	result := &Options{
-		Params:          cloneStringMap(options.Params),
-		Headers:         cloneHeaderMap(options.Headers),
-		HeaderValues:    options.HeaderValues.Clone(),
-		Cookies:         cloneStringMap(options.Cookies),
-		Timeout:         options.Timeout,
-		DisableTimeout:  options.DisableTimeout,
-		HeaderTimeout:   options.HeaderTimeout,
-		ReadIdleTimeout: options.ReadIdleTimeout,
-		BrowserMode:     BrowserMode(strings.ToLower(strings.TrimSpace(string(options.BrowserMode)))),
+		Params:            cloneStringMap(options.Params),
+		Headers:           cloneHeaderMap(options.Headers),
+		HeaderValues:      options.HeaderValues.Clone(),
+		Cookies:           cloneStringMap(options.Cookies),
+		Timeout:           options.Timeout,
+		DisableTimeout:    options.DisableTimeout,
+		HeaderTimeout:     options.HeaderTimeout,
+		ReadIdleTimeout:   options.ReadIdleTimeout,
+		BrowserMode:       BrowserMode(strings.ToLower(strings.TrimSpace(string(options.BrowserMode)))),
+		ClientHintContext: options.ClientHintContext,
 	}
 	if options.HeaderOrder != nil {
 		result.HeaderOrder = append([]string{}, options.HeaderOrder...)
+	}
+	if options.UserActivated != nil {
+		value := *options.UserActivated
+		result.UserActivated = &value
 	}
 	if options.AllowRedirects != nil {
 		allow := *options.AllowRedirects
@@ -173,7 +185,8 @@ func (c *Client) Do(ctx context.Context, method, target string, body any, option
 
 // DoStream returns after response headers arrive. The caller MUST close Body.
 // Reader bodies are not buffered. A non-replayable body is not resent on 307/308;
-// the redirect response is returned instead. No application-level retry occurs.
+// the redirect response is returned instead. Opt-in ClientHints may retry a
+// bodyless GET once for Critical-CH; other application-level retries are absent.
 // An io.ReadCloser body is owned by the client and closed even on setup errors.
 func (c *Client) DoStream(ctx context.Context, method, target string, body any, options *Options) (*StreamResponse, error) {
 	// Until a request reaches the transport, this method owns its upload body.
@@ -188,6 +201,9 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 		ctx = context.Background()
 	}
 	options = cloneOptions(options)
+	if options.ClientHintContext != nil && options.ClientHintContext.origin == "" {
+		return nil, fmt.Errorf("Client Hints context must be built with NewClientHintContext")
+	}
 	if options.ContentLength != nil && *options.ContentLength < -1 {
 		return nil, fmt.Errorf("content length must be -1 or non-negative")
 	}
@@ -210,6 +226,11 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 	userAgent := c.userAgent
 	profile := c.profile
 	browserHeaders := c.browserHeaders
+	strictFingerprint := c.strictFingerprint
+	clientHints := c.clientHints
+	cooldown := c.cooldown
+	exitLocale := c.exitLocale
+	explicitLanguage := c.explicitLanguage
 	timeout := c.timeout
 	maxRedirects := c.maxRedirects
 	configErr := c.configErr
@@ -250,6 +271,19 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 	for key, values := range options.HeaderValues {
 		headers[http.CanonicalHeaderKey(key)] = append([]string(nil), values...)
 	}
+	if options.BrowserMode == BrowserModeNavigation && options.UserActivated != nil && !*options.UserActivated && !headerExists(headers, "Sec-Fetch-User") {
+		// Use the existing explicit-suppression path so redirects preserve this
+		// request context instead of reintroducing activated-navigation defaults.
+		headers["Sec-Fetch-User"] = nil
+	}
+	explicitLanguageHeader := headerExists(headers, "Accept-Language")
+	hintInitiator := requestSource(headers)
+	if options.BrowserMode == BrowserModeNavigation {
+		hintInitiator = ""
+	}
+	if hintInitiator == "" && (options.BrowserMode == BrowserModeFetch || options.BrowserMode == BrowserModeJSON || options.BrowserMode == BrowserModeScript) {
+		hintInitiator = parsedTarget
+	}
 	browserState := newBrowserHeaderState(headers, options.BrowserMode, parsedTarget)
 	profile.UserAgent = userAgent
 	if browserHeaders {
@@ -258,6 +292,27 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 		}
 	} else if !headerExists(headers, "User-Agent") && userAgent != "" {
 		headers.Set("User-Agent", userAgent)
+	}
+	if strictFingerprint {
+		if err := validateIdentityHeaders(headers, profile); err != nil {
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := cooldown.check(parsedTarget); err != nil {
+		return nil, err
+	}
+	if exitLocale != nil {
+		info, _ := exitLocale.resolve(ctx, inner, userAgent, false)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		profile.AcceptLanguage = localeWithDefault(info, profile.AcceptLanguage, explicitLanguage).AcceptLanguage
+		if browserHeaders && options.BrowserMode != BrowserModeOff && !explicitLanguageHeader {
+			headers.Set("Accept-Language", profile.AcceptLanguage)
+		}
 	}
 	headerOrder := defaultHeaderOrder
 	if !customHeaderOrder && browserHeaders && options.BrowserMode != BrowserModeOff {
@@ -292,7 +347,19 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 	var contentLength int64
 	var initialURL *url.URL
 	redirects := 0
+	criticalRetried := false
+	var pinnedHints map[string]bool
+	var retryPolicy *ClientHintContext
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := cooldown.check(currentURL); err != nil {
+			return nil, err
+		}
+		if clientHints != nil && browserHeaders && options.BrowserMode != BrowserModeOff {
+			clientHints.apply(headers, profile, browserState.explicit, currentURL, pinnedHints, options.ClientHintContext, retryPolicy, hintInitiator)
+		}
 		request, err := fhttp.NewRequestWithContext(ctx, currentMethod, currentURL, currentBody)
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
@@ -331,6 +398,7 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 			}
 			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
+		cooldown.observe(currentURL, response.StatusCode, response.Header.Values("Retry-After"))
 		responseCookies := response.Cookies()
 		if len(responseCookies) > 0 {
 			jar.SetCookies(request.URL, responseCookies)
@@ -342,6 +410,24 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 			}
 		}
 
+		// Document subresources use their initiating document's hint set. Their
+		// responses neither opt navigation into new hints nor restart navigation.
+		if clientHints != nil && browserHeaders && options.BrowserMode != BrowserModeOff && options.ClientHintContext == nil {
+			accepted, valid := clientHints.observe(currentURL, response.Header)
+			var responsePolicy *ClientHintContext
+			var policyErr error
+			if _, present := response.Header["Permissions-Policy"]; present {
+				responsePolicy, policyErr = NewClientHintContext(currentURL, http.Header(response.Header))
+			}
+			if valid && policyErr == nil && !criticalRetried && clientHints.criticalRetry(request, response, profile, browserState.explicit, accepted, options.ClientHintContext, responsePolicy, hintInitiator) {
+				response.Body.Close()
+				criticalRetried = true
+				pinnedHints = accepted
+				retryPolicy = responsePolicy
+				currentBody = nil
+				continue
+			}
+		}
 		location := strings.TrimSpace(response.Header.Get("Location"))
 		nextMethod, preserveBody := redirectMethod(currentMethod, response.StatusCode)
 		cannotReplay := preserveBody && request.Body != nil && request.Body != fhttp.NoBody && request.GetBody == nil
@@ -389,6 +475,8 @@ func (c *Client) DoStream(ctx context.Context, method, target string, body any, 
 			}
 		}
 		currentMethod = nextMethod
+		pinnedHints = nil
+		retryPolicy = nil
 		currentURL = nextURL
 		redirects++
 	}

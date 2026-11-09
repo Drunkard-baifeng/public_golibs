@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
+	tlsclient "github.com/Drunkard-baifeng/public_golibs/httpclienttls/internal/tlsclient"
 	fhttp "github.com/bogdanfinn/fhttp"
 	"github.com/bogdanfinn/fhttp/cookiejar"
-	tlsclient "github.com/bogdanfinn/tls-client"
 	"golang.org/x/net/publicsuffix"
 )
 
@@ -30,26 +30,48 @@ const (
 type Config struct {
 	Timeout time.Duration
 	// ProxyHandshakeTimeout bounds tunnel setup only, never the response stream.
-	ProxyHandshakeTimeout   time.Duration
-	MaxRedirects            int
-	Verify                  *bool
-	Proxy                   string
-	ProxyType               string
-	Profile                 string
-	ProfilePool             []string
-	UserAgent               string
-	AcceptLanguage          string
+	ProxyHandshakeTimeout time.Duration
+	MaxRedirects          int
+	Verify                *bool
+	Proxy                 string
+	ProxyType             string
+	Profile               string
+	ProfilePool           []string
+	// FingerprintSeed deterministically chooses a profile from the normalized,
+	// sorted pool. Explicit Profile takes precedence; TLS randomness is untouched.
+	FingerprintSeed string
+	// BrowserIdentity changes HTTP metadata, not the selected TLS/HTTP2 preset.
+	BrowserIdentity *BrowserIdentity
+	// HighEntropyClientHints explicitly opts in on trustworthy destinations.
+	// It does not implement server-driven Accept-CH negotiation.
+	HighEntropyClientHints bool
+	// ClientHints enables response-driven negotiation instead of eager hints.
+	ClientHints *ClientHintsConfig
+	// Cooldown optionally blocks subsequent same-origin requests after HTTP
+	// errors. Nil keeps existing behavior; responses are never auto-retried.
+	Cooldown *CooldownConfig
+	// StrictFingerprint rejects non-empty UA/UA Client Hints overrides that differ
+	// from the configured identity, including unmodeled Sec-CH-UA-* headers.
+	// False preserves unrestricted header overrides.
+	StrictFingerprint bool
+	UserAgent         string
+	AcceptLanguage    string
+	// ExitLocale opts into exit-IP locale lookup; nil preserves offline construction
+	// and existing language defaults. Explicit AcceptLanguage always wins.
+	ExitLocale              *ExitLocaleConfig
 	BrowserHeaders          *bool
 	RandomTLSExtensionOrder *bool
 	EnableSessionResumption *bool
 	EnableHTTP3             bool
-	EnableProtocolRacing    bool
-	MaxResponseBodyBytes    int64
-	MaxIdleConns            int
-	MaxIdleConnsPerHost     int
-	MaxConnsPerHost         int
-	IdleConnTimeout         time.Duration
-	DisableKeepAlives       bool
+	// EnableProtocolRacing races only bodyless GET/HEAD requests when HTTP/3
+	// is enabled and no proxy is configured. Uploads use one transport.
+	EnableProtocolRacing bool
+	MaxResponseBodyBytes int64
+	MaxIdleConns         int
+	MaxIdleConnsPerHost  int
+	MaxConnsPerHost      int
+	IdleConnTimeout      time.Duration
+	DisableKeepAlives    bool
 }
 
 // BoolPtr is a convenience helper for pointer-valued boolean options.
@@ -70,6 +92,12 @@ type Client struct {
 	proxyURL                string
 	userAgent               string
 	browserHeaders          bool
+	strictFingerprint       bool
+	clientHints             *clientHintCache
+	cooldown                *cooldownState
+	exitLocaleConfig        *ExitLocaleConfig
+	exitLocale              *exitLocaleState
+	explicitLanguage        bool
 	randomTLSExtensionOrder bool
 	enableSessionResumption bool
 	enableHTTP3             bool
@@ -113,13 +141,32 @@ func NewClient(config Config) (*Client, error) {
 
 func newClient(config Config) (*Client, error) {
 	client := newClientShell(config)
-	profile, err := selectProfile(config.Profile, config.ProfilePool)
+	profile, err := selectProfile(config)
 	if err != nil {
 		return client, err
 	}
+	if config.StrictFingerprint && strings.TrimSpace(config.UserAgent) != "" && strings.TrimSpace(config.UserAgent) != profile.UserAgent {
+		return client, fmt.Errorf("UserAgent conflicts with the configured browser identity")
+	}
+	localeConfig, err := normalizeExitLocale(config.ExitLocale)
+	if err != nil {
+		return client, err
+	}
+	hints, err := newClientHintCache(config.ClientHints)
+	if err != nil {
+		return client, err
+	}
+	client.clientHints = hints
+	cooldown, err := newCooldownState(config.Cooldown)
+	if err != nil {
+		return client, err
+	}
+	client.cooldown = cooldown
+	client.exitLocaleConfig = localeConfig
 	client.profile = profile
 	if value := strings.TrimSpace(config.AcceptLanguage); value != "" {
 		client.profile.AcceptLanguage = value
+		client.explicitLanguage = true
 	}
 	client.userAgent = strings.TrimSpace(config.UserAgent)
 	if client.userAgent == "" {
@@ -130,7 +177,7 @@ func newClient(config Config) (*Client, error) {
 	}
 	client.profile.RandomTLSExtensionOrder = client.randomTLSExtensionOrder
 	client.profile.SessionResumption = client.enableSessionResumption && profile.supportsSessionResumption
-	client.headerOrder = append([]string(nil), profile.headerOrder...)
+	client.headerOrder = profileHeaderOrder(profile, BrowserModeIdentity, false)
 
 	proxyURL, err := normalizeProxyURL(config.Proxy, config.ProxyType)
 	if err != nil {
@@ -199,6 +246,7 @@ func newClientShell(config Config) *Client {
 		maxRedirects:            maxRedirects,
 		verify:                  verify,
 		browserHeaders:          browserHeaders,
+		strictFingerprint:       config.StrictFingerprint,
 		randomTLSExtensionOrder: randomExtensionOrder,
 		enableSessionResumption: enableSessionResumption,
 		enableHTTP3:             config.EnableHTTP3,
@@ -271,6 +319,11 @@ func (c *Client) rebuildLocked() error {
 	}
 	old := c.inner
 	c.inner = inner
+	if c.exitLocaleConfig != nil {
+		// Bind the cache to this exact transport snapshot. Old in-flight lookups
+		// may finish, but never publish their locale into a rebuilt/new route.
+		c.exitLocale = &exitLocaleState{config: *c.exitLocaleConfig}
+	}
 	if old != nil {
 		old.CloseIdleConnections()
 	}
@@ -283,6 +336,7 @@ func (c *Client) Profile() Profile {
 	defer c.mu.RUnlock()
 	profile := publicProfile(c.profile)
 	profile.UserAgent = c.userAgent
+	profile.AcceptLanguage = localeWithDefault(c.exitLocale.snapshot(), profile.AcceptLanguage, c.explicitLanguage).AcceptLanguage
 	return profile
 }
 
@@ -407,7 +461,7 @@ func (c *Client) SetHeaderOrder(order []string) *Client {
 // ResetHeaderOrder restores the selected browser profile's request-aware order.
 func (c *Client) ResetHeaderOrder() *Client {
 	c.mu.Lock()
-	c.headerOrder = append([]string(nil), c.profile.headerOrder...)
+	c.headerOrder = profileHeaderOrder(c.profile, BrowserModeIdentity, false)
 	c.customHeaderOrder = false
 	c.mu.Unlock()
 	return c
@@ -452,6 +506,9 @@ func (c *Client) UpdateCookies(cookies any) *Client {
 	return c
 }
 
+// GetCookies returns a legacy name-only snapshot of observed responses and
+// explicit overrides. It is not URL-scoped and may include stale observations.
+// Use CookiesForURL or CookieHeader for cookies eligible for an HTTP target.
 func (c *Client) GetCookies() map[string]string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -462,6 +519,8 @@ func (c *Client) GetCookies() map[string]string {
 	return result
 }
 
+// ClearCookies clears cookies and negotiated Client Hints preferences together.
+// Responses already in flight remain detached from the replacement stores.
 func (c *Client) ClearCookies() *Client {
 	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	c.mu.Lock()
@@ -473,14 +532,17 @@ func (c *Client) ClearCookies() *Client {
 	c.jar = jar
 	c.cookies = make(map[string]string)
 	c.observedCookies = make(map[string]string)
+	if c.clientHints != nil {
+		c.clientHints, _ = newClientHintCache(&c.clientHints.config)
+	}
 	return c
 }
 
 // SetCookie stores a scoped cookie directly in the Client cookie jar.
 func (c *Client) SetCookie(targetURL, name, value, domain, path string, secure bool) error {
-	parsedURL, err := url.Parse(strings.TrimSpace(targetURL))
-	if err != nil || parsedURL.Host == "" {
-		return fmt.Errorf("invalid cookie URL %q", targetURL)
+	parsedURL, err := parseCookieURL(targetURL)
+	if err != nil {
+		return err
 	}
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("cookie name is empty")
@@ -500,8 +562,8 @@ func (c *Client) SetCookie(targetURL, name, value, domain, path string, secure b
 }
 
 func (c *Client) CookieValue(targetURL, name string) string {
-	parsedURL, err := url.Parse(strings.TrimSpace(targetURL))
-	if err != nil || parsedURL.Host == "" {
+	parsedURL, err := parseCookieURL(targetURL)
+	if err != nil {
 		return ""
 	}
 	c.mu.RLock()

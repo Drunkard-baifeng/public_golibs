@@ -48,6 +48,9 @@ func applyBrowserHeaders(headers fhttp.Header, profile Profile, mode BrowserMode
 		setHeaderDefault(headers, "Sec-Ch-Ua", profile.SecCHUA)
 		setHeaderDefault(headers, "Sec-Ch-Ua-Mobile", boolClientHint(profile.Mobile))
 		setHeaderDefault(headers, "Sec-Ch-Ua-Platform", `"`+profile.Platform+`"`)
+		if profile.HighEntropyClientHints {
+			applyHighEntropyHeaders(headers, profile)
+		}
 	}
 
 	switch mode {
@@ -176,25 +179,31 @@ func normalizeHeaderOrder(order []string) []string {
 }
 
 func profileHeaderOrder(profile Profile, mode BrowserMode, redirected bool) []string {
+	order := profile.headerOrder
 	if profile.Browser == "chrome" || profile.Browser == "brave" {
 		switch mode {
 		case BrowserModeNavigation:
 			if redirected {
-				return append([]string(nil), chromiumRedirectHeaderOrder...)
+				order = chromiumRedirectHeaderOrder
 			}
 		case BrowserModeFetch, BrowserModeJSON:
-			return append([]string(nil), chromiumFetchHeaderOrder...)
+			order = chromiumFetchHeaderOrder
 		case BrowserModeScript:
-			return append([]string(nil), chromiumScriptHeaderOrder...)
+			order = chromiumScriptHeaderOrder
 		}
 	}
-	return append([]string(nil), profile.headerOrder...)
+	result := append([]string(nil), order...)
+	if profile.HighEntropyClientHints || profile.NegotiatedClientHints {
+		for _, key := range clientHintHeaderNames[3:] {
+			result = append(result, strings.ToLower(key))
+		}
+	}
+	return result
 }
 
-var browserContextHeaders = []string{
-	"Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform",
+var browserContextHeaders = append([]string{
 	"Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Sec-Fetch-User",
-}
+}, clientHintHeaderNames...)
 
 // Keep the original initiator and the least-trusted hop across redirects.
 // Generated headers may change with the destination; explicit overrides stay.

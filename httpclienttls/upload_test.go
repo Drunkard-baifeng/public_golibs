@@ -9,7 +9,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -113,12 +112,6 @@ func TestResponseCloseCancelsBlockedUpload(t *testing.T) {
 func TestRedirectClosesDiscardedUploadBeforeFinalResponse(t *testing.T) {
 	for _, h2 := range []bool{false, true} {
 		t.Run(fmt.Sprint("http2=", h2), func(t *testing.T) {
-			if h2 && os.Getenv("HTTPCLIENTTLS_UPSTREAM_TEST") != "1" {
-				// fhttp waits for its upload writer after an early >=300 response,
-				// but never closes a blocked reader. Keep this opt-in reproducer
-				// until upstream closes the body before joining the writer.
-				t.Skip("known upstream HTTP/2 blocked-upload issue; set HTTPCLIENTTLS_UPSTREAM_TEST=1 to reproduce")
-			}
 			reader, writer := io.Pipe()
 			defer reader.Close()
 			defer writer.Close()
@@ -169,17 +162,9 @@ func TestRedirectClosesDiscardedUploadBeforeFinalResponse(t *testing.T) {
 
 func TestBlockedUploadRespectsCancellation(t *testing.T) {
 	for _, h2 := range []bool{false, true} {
-		for _, mode := range []string{"header", "total", "parent", "early-response"} {
-			if mode == "early-response" && !h2 {
-				continue // The upstream early-response stall only affects HTTP/2.
-			}
+		for _, mode := range []string{"header", "total", "parent"} {
 			t.Run(fmt.Sprintf("http2=%t/%s", h2, mode), func(t *testing.T) {
 				s := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if mode == "early-response" {
-						w.WriteHeader(http.StatusForbidden)
-						w.(http.Flusher).Flush()
-						return
-					}
 					io.Copy(io.Discard, r.Body)
 				}))
 				s.EnableHTTP2 = h2
@@ -194,7 +179,7 @@ func TestBlockedUploadRespectsCancellation(t *testing.T) {
 				opts := &Options{DisableTimeout: true}
 				want := error(context.Canceled)
 				switch mode {
-				case "header", "early-response":
+				case "header":
 					opts.HeaderTimeout = 150 * time.Millisecond
 					want = ErrHeaderTimeout
 				case "total":
@@ -238,6 +223,138 @@ func TestBlockedUploadRespectsCancellation(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestHTTP2EarlyResponseStopsBlockedUpload(t *testing.T) {
+	for _, status := range []int{302, 307, 308, 403, 413, 500} {
+		for _, mode := range []string{"unknown-length", "known-length", "eof-probe"} {
+			t.Run(fmt.Sprintf("status=%d/%s", status, mode), func(t *testing.T) {
+				reader, writer := io.Pipe()
+				defer writer.Close()
+				defer reader.Close()
+				body := &observedUpload{ReadCloser: reader, started: make(chan struct{}), closed: make(chan struct{})}
+				release := make(chan struct{})
+				s := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.ProtoMajor != 2 {
+						t.Error("request did not use HTTP/2")
+					}
+					w.Header().Set("X-Connection", r.RemoteAddr)
+					if r.URL.Path == "/next" {
+						fmt.Fprint(w, "next")
+						return
+					}
+					select {
+					case <-body.started:
+					case <-r.Context().Done():
+						return
+					}
+					if status == 307 || status == 308 {
+						w.Header().Set("Location", "/next")
+					}
+					w.WriteHeader(status)
+					w.(http.Flusher).Flush()
+					// The response must return before the server sends its body.
+					select {
+					case <-release:
+						if mode == "unknown-length" {
+							if _, err := io.Copy(io.Discard, r.Body); err != nil {
+								t.Error(err)
+								return
+							}
+						}
+						fmt.Fprint(w, "early response body")
+					case <-r.Context().Done():
+					}
+				}))
+				s.EnableHTTP2 = true
+				s.StartTLS()
+				defer s.Close()
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				c := streamClient(t)
+				opts := &Options{DisableTimeout: true}
+				var upload io.ReadCloser = body
+				if mode != "unknown-length" {
+					length := int64(10)
+					opts.ContentLength = &length
+				}
+				if mode == "eof-probe" {
+					// The first read matches Content-Length, then the EOF probe
+					// blocks. Closing must not turn it into a response reset.
+					upload = struct {
+						io.Reader
+						io.Closer
+					}{io.MultiReader(strings.NewReader("0123456789"), body), body}
+				}
+				r, err := c.DoStream(ctx, http.MethodPost, s.URL, upload, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Body.Close()
+				if r.StatusCode != status {
+					t.Fatalf("status=%d, want %d (non-replayable upload must not follow 307/308)", r.StatusCode, status)
+				}
+				if got := body.closes.Load(); got != 1 {
+					t.Fatalf("upload closed %d times before response, want once", got)
+				}
+				close(release)
+				data, err := io.ReadAll(r.Body)
+				if err != nil || string(data) != "early response body" {
+					t.Fatalf("response body=%q err=%v", data, err)
+				}
+				r.Body.Close()
+				next, err := c.Do(ctx, http.MethodGet, s.URL+"/next", nil, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if next.Headers.Get("X-Connection") != r.Headers.Get("X-Connection") {
+					t.Fatal("early response prevented HTTP/2 connection reuse")
+				}
+				if got := body.closes.Load(); got != 1 {
+					t.Fatalf("upload closed %d times, want once", got)
+				}
+			})
+		}
+	}
+}
+
+func TestHTTP2SuccessKeepsUploadWritable(t *testing.T) {
+	s := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusEarlyHints)
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		w.Write(data)
+	}))
+	s.EnableHTTP2 = true
+	s.StartTLS()
+	defer s.Close()
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	body := &observedUpload{ReadCloser: reader, started: make(chan struct{}), closed: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	r, err := streamClient(t).DoStream(ctx, http.MethodPost, s.URL, body, &Options{DisableTimeout: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if body.closes.Load() != 0 {
+		t.Fatal("successful response closed an ongoing upload")
+	}
+	if _, err := io.WriteString(writer, "upload after response headers"); err != nil {
+		t.Fatal(err)
+	}
+	writer.Close()
+	data, err := io.ReadAll(r.Body)
+	if err != nil || string(data) != "upload after response headers" {
+		t.Fatalf("full duplex response=%q err=%v", data, err)
 	}
 }
 

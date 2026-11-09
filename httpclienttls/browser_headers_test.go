@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
+	tlsclient "github.com/Drunkard-baifeng/public_golibs/httpclienttls/internal/tlsclient"
 	fhttp "github.com/bogdanfinn/fhttp"
-	tlsclient "github.com/bogdanfinn/tls-client"
 )
 
 func TestBrowserModeOffNormalization(t *testing.T) {

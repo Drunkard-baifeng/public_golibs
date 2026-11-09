@@ -2,6 +2,7 @@ package httpclienttls
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"math/big"
 	"sort"
@@ -22,6 +23,10 @@ type Profile struct {
 	AcceptEncoding          string
 	RandomTLSExtensionOrder bool
 	SessionResumption       bool
+	Identity                BrowserIdentity
+	HighEntropyClientHints  bool
+	NegotiatedClientHints   bool
+	SecCHUAFullVersionList  string
 
 	client                    profiles.ClientProfile
 	resumptionClient          profiles.ClientProfile
@@ -119,6 +124,19 @@ var profileRegistry = map[string]Profile{
 		AcceptLanguage: "en-US,en;q=0.9", AcceptEncoding: "gzip, deflate, br",
 		client: profiles.Safari_IOS_26_0, headerOrder: safariHeaderOrder,
 	},
+	// Legacy desktop presets are explicit-only and excluded from the default pool.
+	"safari_15_6_1": {
+		Name: "safari_15_6_1", Browser: "safari", Platform: "macOS",
+		UserAgent:      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.6.1 Safari/605.1.15",
+		AcceptLanguage: "en-US,en;q=0.9", AcceptEncoding: "gzip, deflate, br",
+		client: profiles.Safari_15_6_1, headerOrder: safariHeaderOrder,
+	},
+	"safari_16_0": {
+		Name: "safari_16_0", Browser: "safari", Platform: "macOS",
+		UserAgent:      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+		AcceptLanguage: "en-US,en;q=0.9", AcceptEncoding: "gzip, deflate, br",
+		client: profiles.Safari_16_0, headerOrder: safariHeaderOrder,
+	},
 }
 
 var defaultRandomProfiles = []string{
@@ -148,20 +166,25 @@ func publicProfile(profile Profile) Profile {
 		AcceptLanguage: profile.AcceptLanguage, AcceptEncoding: profile.AcceptEncoding,
 		RandomTLSExtensionOrder: profile.RandomTLSExtensionOrder,
 		SessionResumption:       profile.SessionResumption,
+		Identity:                profile.Identity, HighEntropyClientHints: profile.HighEntropyClientHints,
+		NegotiatedClientHints:  profile.NegotiatedClientHints,
+		SecCHUAFullVersionList: profile.SecCHUAFullVersionList,
 	}
 }
 
-func selectProfile(name string, pool []string) (Profile, error) {
-	name = normalizeProfileName(name)
+func selectProfile(config Config) (Profile, error) {
+	name := normalizeProfileName(config.Profile)
 	if name != "" {
 		profile, ok := profileRegistry[name]
 		if !ok {
 			return Profile{}, fmt.Errorf("unsupported TLS profile %q", name)
 		}
-		return profile, nil
+		return configureProfileIdentity(profile, config)
 	}
 
-	if len(pool) == 0 {
+	pool := config.ProfilePool
+	implicitPool := len(pool) == 0
+	if implicitPool {
 		pool = defaultRandomProfiles
 	}
 	candidates := make([]Profile, 0, len(pool))
@@ -172,6 +195,13 @@ func selectProfile(name string, pool []string) (Profile, error) {
 		if !ok {
 			return Profile{}, fmt.Errorf("unsupported TLS profile %q", candidate)
 		}
+		profile, err := configureProfileIdentity(profile, config)
+		if err != nil {
+			if implicitPool {
+				continue
+			}
+			return Profile{}, fmt.Errorf("profile pool entry %q: %w", candidate, err)
+		}
 		if _, exists := seen[candidate]; exists {
 			continue
 		}
@@ -179,7 +209,16 @@ func selectProfile(name string, pool []string) (Profile, error) {
 		candidates = append(candidates, profile)
 	}
 	if len(candidates) == 0 {
-		return Profile{}, fmt.Errorf("TLS profile pool is empty")
+		return Profile{}, fmt.Errorf("no TLS profile matches the configured browser identity")
+	}
+	if config.FingerprintSeed != "" {
+		// Versioned domain separation keeps the mapping independent of other
+		// application uses of the seed. Pool order and aliases do not matter.
+		sort.Slice(candidates, func(i, j int) bool { return candidates[i].Name < candidates[j].Name })
+		digest := sha256.Sum256([]byte("httpclienttls/profile/v1\x00" + config.FingerprintSeed))
+		index := new(big.Int).SetBytes(digest[:])
+		index.Mod(index, big.NewInt(int64(len(candidates))))
+		return candidates[index.Int64()], nil
 	}
 
 	index, err := rand.Int(rand.Reader, big.NewInt(int64(len(candidates))))
@@ -206,6 +245,10 @@ func normalizeProfileName(name string) string {
 		return "safari_ios_18_5"
 	case "safari-ios-26.0", "safari_ios_26.0", "safari_ios_26_0":
 		return "safari_ios_26_0"
+	case "safari15.6.1", "safari-15.6.1", "safari_15.6.1":
+		return "safari_15_6_1"
+	case "safari16", "safari16.0", "safari-16.0", "safari_16.0":
+		return "safari_16_0"
 	default:
 		return name
 	}
